@@ -1,0 +1,45 @@
+{
+  "name": "paseo-model-switch",
+  "private": true,
+  "version": "0.6.0",
+  "description": "Seamless mid-session and cross-provider model switching plugin for Paseo with silent context handoff, multi-hop transcript search, and minimal UI footprint.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/shinelinxx/paseo-model-switch.git"
+  },
+  "homepage": "https://github.com/shinelinxx/paseo-model-switch#readme",
+  "keywords": [
+    "paseo",
+    "paseo-plugin",
+    "model-switch",
+    "cross-provider",
+    "ai-agents"
+  ],
+  "files": [
+    "paseo-plugin.json",
+    "OVERVIEW.md",
+    "OVERVIEW.*.md",
+    "index.client.ts",
+    "index.client.tsx",
+    "index.server.ts",
+    "index.server.tsx",
+    "client/",
+    "server/",
+    "shared/"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test tests/*.test.ts"
+  },
+  "devDependencies": {
+    "@getpaseo/plugin": "0.17.4",
+    "@tanstack/react-query": "^5.90.11",
+    "@types/node": "^25.5.0",
+    "@types/react": "~19.2.0",
+    "react": "19.1.0",
+    "react-native": "0.81.5",
+    "typescript": "^5.9.3",
+    "zod": "^4.4.3"
+  }
+}
