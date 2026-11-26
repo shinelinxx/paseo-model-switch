@@ -14,6 +14,25 @@ import type { CachedTimelineEntry, IncrementalTimelineCache } from "./turn-cache
 
 const execFileAsync = promisify(execFile);
 
+export const READ_CONTEXT_TOOL_NAME = "read_previous_session_context";
+
+export function isReadPreviousSessionContextPermission(request: {
+  kind: string;
+  name: string;
+}): boolean {
+  if (request.kind !== "tool") return false;
+  const normalized = request.name.trim().toLowerCase();
+  return (
+    normalized === READ_CONTEXT_TOOL_NAME ||
+    normalized === `mcp__paseo__${READ_CONTEXT_TOOL_NAME}` ||
+    normalized === `mcp_paseo_${READ_CONTEXT_TOOL_NAME}` ||
+    normalized === `paseo_${READ_CONTEXT_TOOL_NAME}` ||
+    normalized === `paseo.${READ_CONTEXT_TOOL_NAME}` ||
+    normalized === `paseo:${READ_CONTEXT_TOOL_NAME}` ||
+    normalized === `paseo/${READ_CONTEXT_TOOL_NAME}`
+  );
+}
+
 export interface RichToolHighlight {
   kind: "error_output" | "edit_diff" | "plan";
   label: string;
@@ -838,7 +857,7 @@ export function compileContextFromEntries(input: {
   let nextRuleNum = 4;
   if (hasOmittedHistory) {
     headerLines.push(
-      `${nextRuleNum}. If you need exact details from earlier turns or prior hops, call \`read_previous_session_context\` (supports \`action: "list_hops" | "search" | "read"\` and \`hop: "all"\`; full transcript is saved at \`${input.transcriptPathPlaceholder}\`).`,
+      `${nextRuleNum}. If you need exact details from earlier turns or prior hops, call \`${READ_CONTEXT_TOOL_NAME}\` (supports \`action: "list_hops" | "search" | "read"\` and \`hop: "all"\`; full transcript is saved at \`${input.transcriptPathPlaceholder}\`).`,
     );
     nextRuleNum += 1;
   }

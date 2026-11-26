@@ -11,6 +11,7 @@ import {
   compactToolRecords,
   compileContextFromEntries,
   estimateCharsPerToken,
+  isReadPreviousSessionContextPermission,
 } from "../server/context.ts";
 import { mapModeForTargetProvider, resolveModeAndOptionsForTarget } from "../server/mode-map.ts";
 import {
@@ -622,5 +623,44 @@ describe("storage, atomic preferences, multi-hop search, and GC", () => {
     } finally {
       await fs.rm(tmpRoot, { recursive: true, force: true });
     }
+  });
+});
+
+describe("permission hook matcher for read_previous_session_context", () => {
+  it("matches exact tool name and Paseo MCP prefixed variants only for tool permissions", () => {
+    const allowedNames = [
+      "read_previous_session_context",
+      "mcp__paseo__read_previous_session_context",
+      "mcp_paseo_read_previous_session_context",
+      "paseo_read_previous_session_context",
+      "paseo.read_previous_session_context",
+      "paseo:read_previous_session_context",
+      "paseo/read_previous_session_context",
+      "  MCP__PASEO__READ_PREVIOUS_SESSION_CONTEXT  ",
+    ];
+    for (const name of allowedNames) {
+      assert.equal(
+        isReadPreviousSessionContextPermission({ kind: "tool", name }),
+        true,
+        `expected ${name} to match`,
+      );
+    }
+
+    assert.equal(
+      isReadPreviousSessionContextPermission({ kind: "plan", name: "read_previous_session_context" }),
+      false,
+    );
+    assert.equal(
+      isReadPreviousSessionContextPermission({ kind: "tool", name: "shell" }),
+      false,
+    );
+    assert.equal(
+      isReadPreviousSessionContextPermission({ kind: "tool", name: "mcp__other__read_previous_session_context" }),
+      false,
+    );
+    assert.equal(
+      isReadPreviousSessionContextPermission({ kind: "tool", name: "read_previous_session_context_extra" }),
+      false,
+    );
   });
 });

@@ -33,7 +33,12 @@ import {
   type ModelSwitchSettings,
   type ModelSwitchSettingsSchema,
 } from "../shared/settings";
-import { collectGitWorkspaceContext, compileContextFromEntries } from "./context";
+import {
+  collectGitWorkspaceContext,
+  compileContextFromEntries,
+  isReadPreviousSessionContextPermission,
+  READ_CONTEXT_TOOL_NAME,
+} from "./context";
 import { resolveModeAndOptionsForTarget } from "./mode-map";
 import {
   generateSwitchId,
@@ -622,18 +627,6 @@ export async function handleSwitchModel(
     modeId: mappedModeId,
     thinkingOptionId,
     options: mappedProviderOptions,
-    toolPolicy:
-      !compiled.isEmptySession && compiled.hasOmittedHistory
-        ? {
-            preapproved: [
-              {
-                kind: "mcp" as const,
-                server: "paseo",
-                tool: "read_previous_session_context",
-              },
-            ],
-          }
-        : undefined,
   };
 
   const cleanFollowUp = input.followUpPrompt?.trim() || undefined;
@@ -786,7 +779,7 @@ export function registerSessionOpenHook(
   const pendingTimers = new Set<ReturnType<typeof setTimeout>>();
   let disposed = false;
 
-  const removeHook = server.addHook("agent.open.before", async ({ request }, { paseo }) => {
+  const removeOpenHook = server.addHook("agent.open.before", async ({ request }, { paseo }) => {
     if (request.purpose !== "interactive") return;
 
     const switchId = readStringMeta(request.metadata, request.labels, SWITCH_META_KEY);
@@ -813,7 +806,7 @@ export function registerSessionOpenHook(
 
     if (shouldAttachTool) {
       const readerTool = defineAgentTool({
-        name: "read_previous_session_context",
+        name: READ_CONTEXT_TOOL_NAME,
         title: "Read Previous Session Context",
         description:
           "Inspect or search full verbatim conversation transcripts from before this session switched models (supports multi-hop chains). Use action='list_hops' to view all prior model segments, action='search' with query and optional hop='all', or action='read' with offset/limit.",
@@ -840,12 +833,39 @@ export function registerSessionOpenHook(
     };
   });
 
+  // Auto-approve our own read-only transcript reader tool on switched agents.
+  // Paseo's `toolPolicy.preapproved` only permits MCP servers explicitly passed in `config.mcpServers`
+  // of the same create request (not the built-in `paseo` server or providers without exact preapproval),
+  // so auto-approval must be handled via the permission hook instead.
+  const removePermissionHook = server.addHook(
+    "agent.permission.before",
+    async ({ agent, request }, { paseo }) => {
+      if (disposed) return;
+      if (!isReadPreviousSessionContextPermission(request)) return;
+      if (!readStringMeta(agent.metadata, undefined, SWITCH_META_KEY)) return;
+
+      const allowAction = request.actions?.find((action) => action.behavior === "allow");
+      try {
+        await paseo.agents.ref(agent.id).respondToPermission({
+          requestId: request.id,
+          response: {
+            behavior: "allow",
+            ...(allowAction ? { selectedActionId: allowAction.id } : {}),
+          },
+        });
+      } catch {
+        // Non-fatal: permission may have already been resolved by the user or another hook
+      }
+    },
+  );
+
   return () => {
     disposed = true;
     for (const timer of pendingTimers) {
       clearTimeout(timer);
     }
     pendingTimers.clear();
-    removeHook();
+    removePermissionHook();
+    removeOpenHook();
   };
 }
