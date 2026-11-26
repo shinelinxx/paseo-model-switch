@@ -1,5 +1,7 @@
 # paseo-model-switch
 
+English | [简体中文](README.zh-CN.md)
+
 Seamless mid-session model switching plugin for [Paseo](https://paseo.sh), supporting both same-provider hot-swaps and cross-provider session continuation (`antigravity`, `codex`, `opencode`, `claude`, `copilot`, `pi`, etc.) with minimal user disruption.
 
 ## Install
