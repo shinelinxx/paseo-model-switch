@@ -22,14 +22,16 @@ import type { CachedTimelineEntry, IncrementalTimelineCache } from "./turn-cache
 const execFileAsync = promisify(execFile);
 
 export const READ_CONTEXT_TOOL_NAME = "read_previous_session_context";
+export const READ_CONTEXT_TOOL_TITLE = "Read Previous Session Context";
 
 export function isReadPreviousSessionContextPermission(request: {
   kind: string;
   name: string;
+  title?: string;
 }): boolean {
   if (request.kind !== "tool") return false;
   const normalized = request.name.trim().toLowerCase();
-  return (
+  if (
     normalized === READ_CONTEXT_TOOL_NAME ||
     normalized === `mcp__paseo__${READ_CONTEXT_TOOL_NAME}` ||
     normalized === `mcp_paseo_${READ_CONTEXT_TOOL_NAME}` ||
@@ -37,6 +39,33 @@ export function isReadPreviousSessionContextPermission(request: {
     normalized === `paseo.${READ_CONTEXT_TOOL_NAME}` ||
     normalized === `paseo:${READ_CONTEXT_TOOL_NAME}` ||
     normalized === `paseo/${READ_CONTEXT_TOOL_NAME}`
+  ) {
+    return true;
+  }
+  // ACP ToolCall permission payloads may fall back to `toolCall.title` when `name` is absent
+  const normalizedTitle = request.title?.trim().toLowerCase() ?? "";
+  const expectedTitle = READ_CONTEXT_TOOL_TITLE.toLowerCase();
+  if (normalized === expectedTitle) return true;
+  if (normalizedTitle === expectedTitle && (normalized === "tool" || normalized === "")) {
+    return true;
+  }
+  return false;
+}
+
+export function selectSafeAllowPermissionAction(
+  actions:
+    | ReadonlyArray<{ id: string; label?: string; behavior: "allow" | "deny" }>
+    | undefined,
+): { id: string; label?: string; behavior: "allow" | "deny" } | undefined {
+  if (!actions || actions.length === 0) return undefined;
+  const allowActions = actions.filter((a) => a.behavior === "allow");
+  if (allowActions.length === 0) return undefined;
+  return (
+    allowActions.find((a) => /once/i.test(a.id) || /once/i.test(a.label ?? "")) ??
+    allowActions.find(
+      (a) => !/always|session|server|all/i.test(`${a.id} ${a.label ?? ""}`),
+    ) ??
+    allowActions[0]
   );
 }
 
@@ -94,6 +123,7 @@ export interface CompiledContext {
   transcriptMarkdown: string;
   previewTurns: PreviewTurn[];
   ancestorSummary: string;
+  initialTaskAnchor?: string;
 }
 
 export function truncateText(
@@ -245,31 +275,37 @@ function summarizeToolCall(
         ? " [CANCELED]"
         : "";
 
+  const succeeded = item.status === "completed";
+
   switch (d.type) {
     case "edit": {
-      filesEdited.add(d.filePath);
+      if (succeeded) {
+        filesEdited.add(d.filePath);
+      }
       if (d.unifiedDiff && d.unifiedDiff.trim()) {
         richHighlights.push({
           kind: "edit_diff",
-          label: `Edit ${d.filePath}`,
+          label: `Edit ${d.filePath}${statusTag}`,
           body: truncateText(d.unifiedDiff, 800),
         });
       } else if (d.oldString !== undefined && d.newString !== undefined) {
         richHighlights.push({
           kind: "edit_diff",
-          label: `Edit ${d.filePath}`,
+          label: `Edit ${d.filePath}${statusTag}`,
           body: truncateText(`- ${d.oldString}\n+ ${d.newString}`, 800),
         });
       }
       return { kind: "edit", failed, target: d.filePath, summary: `edit ${d.filePath}${statusTag}` };
     }
     case "write": {
-      filesWritten.add(d.filePath);
-      filesEdited.add(d.filePath);
+      if (succeeded) {
+        filesWritten.add(d.filePath);
+        filesEdited.add(d.filePath);
+      }
       if (d.content && d.content.trim()) {
         richHighlights.push({
           kind: "edit_diff",
-          label: `Write ${d.filePath}`,
+          label: `Write ${d.filePath}${statusTag}`,
           body: truncateText(d.content, 600),
         });
       }
@@ -379,7 +415,7 @@ function summarizeToolCall(
   }
 }
 
-function extractIncomingAgentMessageText(item: ToolCallTimelineItem): string | null {
+function extractIncomingAgentMessage(item: ToolCallTimelineItem): string | null {
   const detail = item.detail;
   const isAgentMessage =
     item.name === "agent_message" ||
@@ -387,20 +423,24 @@ function extractIncomingAgentMessageText(item: ToolCallTimelineItem): string | n
     Boolean(item.agentMessage);
   if (!isAgentMessage) return null;
 
-  if (detail.type === "plain_text" && typeof detail.text === "string" && detail.text.trim()) {
-    return detail.text.trim();
+  const am = item.agentMessage;
+  let body: string | null = null;
+  if (am && typeof am.text === "string" && am.text.trim()) {
+    body = am.text.trim();
+  } else if (detail.type === "plain_text" && typeof detail.text === "string" && detail.text.trim()) {
+    body = detail.text.trim();
   }
-  const msg = item.agentMessage as Record<string, unknown> | undefined;
-  if (msg && typeof msg === "object") {
-    for (const key of ["text", "content", "message", "body"]) {
-      const val = msg[key];
-      if (typeof val === "string" && val.trim()) {
-        return val.trim();
-      }
-    }
+  if (!body) return null;
+
+  if (am) {
+    const senderLabel = am.sender?.title?.trim() || am.sender?.id?.trim() || "agent";
+    const eventLabel = am.event && am.event !== "message" ? ` (${am.event})` : "";
+    return `[Agent Message${eventLabel} from ${senderLabel}]\n${body}`;
   }
-  return null;
+  return `[Handoff / Agent Message]\n${body}`;
 }
+
+export type CanonicalTurnsResult = ReturnType<typeof buildCanonicalTurns>;
 
 export function buildCanonicalTurns(
   entries: Array<{ item: AgentTimelineItem; timestamp: string; seqStart: number }>,
@@ -521,10 +561,9 @@ export function buildCanonicalTurns(
         break;
       }
       case "tool_call": {
-        const agentMsgText = extractIncomingAgentMessageText(item);
-        if (agentMsgText) {
-          const formattedMsg = `[Handoff / Agent Message]\n${agentMsgText}`;
-          if (!current || current.assistantTexts.length > 0 || current.userText.trim()) {
+        const formattedMsg = extractIncomingAgentMessage(item);
+        if (formattedMsg) {
+          if (!current || current.assistantTexts.length > 0) {
             flush();
             current = {
               timestamp,
@@ -540,6 +579,9 @@ export function buildCanonicalTurns(
               filesRead: new Set(),
               errors: [],
             };
+          } else if (current.userText.trim()) {
+            // Append consecutive pre-reply agent messages instead of creating orphan empty turns
+            current.userText = `${current.userText.trim()}\n\n${formattedMsg}`;
           } else {
             current.userText = formattedMsg;
           }
@@ -674,15 +716,35 @@ function defaultAntigravityBrainRoot(): string {
   return path.join(os.homedir(), ".gemini", "antigravity-cli", "brain");
 }
 
+const BOILERPLATE_BARE_FILENAMES = new Set([
+  "package.json",
+  "package-lock.json",
+  "pnpm-lock.yaml",
+  "yarn.lock",
+  "tsconfig.json",
+  "readme.md",
+  "readme.zh-cn.md",
+  "license",
+  "overview.md",
+  "overview.zh-cn.md",
+  ".gitignore",
+]);
+
 function isIgnoredMentionedPath(filePath: string): boolean {
   const normalized = filePath.replace(/\\/g, "/");
+  const tmpNormalized = os.tmpdir().replace(/\\/g, "/").replace(/\/+$/, "");
   if (
     normalized.includes("/.git/") ||
     normalized.includes("/node_modules/") ||
     normalized.includes("/.system_generated/") ||
     normalized.startsWith("/dev/") ||
     normalized.endsWith("/SKILL.md") ||
-    normalized.includes("/.paseo/plugin-data/model-switch/")
+    normalized.includes("/.paseo/plugin-data/model-switch/") ||
+    normalized.includes("/.gemini/antigravity-cli/mcp/") ||
+    normalized.includes("/paseo-attachments-") ||
+    (tmpNormalized &&
+      normalized.startsWith(`${tmpNormalized}/`) &&
+      normalized.includes("paseo-attachments-"))
   ) {
     return true;
   }
@@ -699,8 +761,11 @@ function normalizeCandidatePath(raw: string, cwd: string): string | null {
       clean = clean.slice("file://".length);
     }
   }
-  // Strip line/column anchors like #L10-L20 or :12:4
-  clean = clean.replace(/#L\d+(?:-L\d+)?$/i, "").replace(/#.*$/, "");
+  // Strip line/column anchors like #L10-L20, #anchor, or :12 / :12:4
+  clean = clean
+    .replace(/#L\d+(?:-L\d+)?$/i, "")
+    .replace(/#.*$/, "")
+    .replace(/:\d+(?::\d+)?$/, "");
   clean = clean.replace(/[),.;:'"`]+$/, "");
   if (!clean || clean.includes("\n") || clean.includes("\0")) return null;
 
@@ -731,11 +796,18 @@ export function extractMentionedFilePaths(text: string, cwd: string): string[] {
   }
 
   // 2. Inline code absolute / home / workspace-relative file paths (verified on disk later via fs.stat)
-  const backtickPathRe = /`((?:\/|~\/|[a-zA-Z0-9._\u4e00-\u9fff-]+(?:\/[a-zA-Z0-9._\u4e00-\u9fff-]+)*)\.[a-zA-Z0-9]{1,12})`/g;
+  const backtickPathRe =
+    /`((?:\/|~\/)?[a-zA-Z0-9._\u4e00-\u9fff-]+(?:\/[a-zA-Z0-9._\u4e00-\u9fff-]+)*\.[a-zA-Z0-9]{1,12}(?::\d+(?::\d+)?)?)`/g;
   while ((match = backtickPathRe.exec(text)) !== null) {
     const candidate = match[1].trim();
     if (/^https?:\/\//i.test(candidate)) continue;
-    if (candidate.includes(" ") && !candidate.startsWith("/Users/")) continue;
+    const withoutLine = candidate.replace(/:\d+(?::\d+)?$/, "");
+    if (
+      !withoutLine.includes("/") &&
+      BOILERPLATE_BARE_FILENAMES.has(withoutLine.toLowerCase())
+    ) {
+      continue;
+    }
     const resolved = normalizeCandidatePath(candidate, cwd);
     if (resolved && !isIgnoredMentionedPath(resolved)) {
       found.add(resolved);
@@ -874,16 +946,65 @@ export async function copyAntigravityBrainFiles(
   return copied;
 }
 
+export async function copyPersistedArtifactsToAntigravityBrain(
+  outputFiles: readonly SessionOutputFile[],
+  targetSessionId: string | null | undefined,
+  brainBaseDir = defaultAntigravityBrainRoot(),
+): Promise<string[]> {
+  const dstId = extractAntigravitySessionId(targetSessionId);
+  if (!dstId) return [];
+
+  const brainArtifacts = outputFiles.filter(
+    (f) => f.origin === "artifact" || f.origin === "scratch" || f.origin === "uploaded",
+  );
+  if (brainArtifacts.length === 0) return [];
+
+  const dstDir = path.join(brainBaseDir, dstId);
+  const copied: string[] = [];
+  let totalBytes = 0;
+
+  for (const item of brainArtifacts.slice(0, MAX_BRAIN_COPY_FILES)) {
+    try {
+      const st = await fs.stat(item.path);
+      if (!st.isFile()) continue;
+      if (totalBytes + st.size > MAX_BRAIN_COPY_BYTES) continue;
+      // Skip if the file already lives inside the target brain dir
+      const relToTarget = path.relative(dstDir, item.path);
+      if (relToTarget && !relToTarget.startsWith("..") && !path.isAbsolute(relToTarget)) {
+        continue;
+      }
+      const subDir =
+        item.origin === "scratch"
+          ? "scratch"
+          : item.origin === "uploaded"
+            ? ".user_uploaded"
+            : "";
+      const fileName = path.basename(item.path);
+      if (!fileName || fileName === "." || fileName === "..") continue;
+      const destPath = subDir ? path.join(dstDir, subDir, fileName) : path.join(dstDir, fileName);
+      await fs.mkdir(path.dirname(destPath), { recursive: true });
+      await fs.copyFile(item.path, destPath, fs.constants.COPYFILE_EXCL);
+      totalBytes += st.size;
+      copied.push(destPath);
+    } catch {
+      // Skip existing or unreadable files without failing the switch
+    }
+  }
+  return copied;
+}
+
 export async function collectSessionOutputFiles(input: {
   cwd: string;
   entries: CachedTimelineEntry[];
+  canonical?: CanonicalTurnsResult;
   gitStatusShort: string;
   sourceProvider: string;
   sourceSessionId?: string | null;
   ancestorOutputFiles?: readonly SessionOutputFile[];
   brainBaseDir?: string;
 }): Promise<SessionOutputFile[]> {
-  const { turns, filesWritten, filesEdited } = buildCanonicalTurns(input.entries);
+  const { turns, filesWritten, filesEdited } =
+    input.canonical ?? buildCanonicalTurns(input.entries);
   const byPath = new Map<string, OutputFileOrigin>();
 
   const register = (rawPath: string, origin: OutputFileOrigin) => {
@@ -938,37 +1059,17 @@ export async function collectSessionOutputFiles(input: {
     .slice(0, 48);
 
   const verified: SessionOutputFile[] = [];
-  let previewCount = 0;
 
   await Promise.all(
     ordered.map(async ([filePath, origin]) => {
       try {
         const st = await fs.stat(filePath);
         if (!st.isFile()) return;
-        const entry: SessionOutputFile = {
+        verified.push({
           path: filePath,
           origin,
           sizeBytes: st.size,
-        };
-        const ext = path.extname(filePath).toLowerCase();
-        if (
-          origin === "artifact" &&
-          TEXT_ARTIFACT_EXTS.has(ext) &&
-          st.size > 0 &&
-          st.size <= 24 * 1024 &&
-          previewCount < 4
-        ) {
-          previewCount += 1;
-          try {
-            const raw = await fs.readFile(filePath, "utf8");
-            if (raw.trim()) {
-              entry.preview = truncateText(raw, 480);
-            }
-          } catch {
-            // Non-fatal
-          }
-        }
-        verified.push(entry);
+        });
       } catch {
         // Skip paths that do not exist on disk
       }
@@ -979,7 +1080,34 @@ export async function collectSessionOutputFiles(input: {
     (a, b) =>
       ORIGIN_PRIORITY[a.origin] - ORIGIN_PRIORITY[b.origin] || a.path.localeCompare(b.path),
   );
-  return verified.slice(0, MAX_OUTPUT_FILES);
+  const capped = verified.slice(0, MAX_OUTPUT_FILES);
+
+  // Deterministically read previews for up to 4 small text artifacts after sorting
+  const previewCandidates = capped
+    .filter(
+      (entry) =>
+        entry.origin === "artifact" &&
+        TEXT_ARTIFACT_EXTS.has(path.extname(entry.path).toLowerCase()) &&
+        typeof entry.sizeBytes === "number" &&
+        entry.sizeBytes > 0 &&
+        entry.sizeBytes <= 24 * 1024,
+    )
+    .slice(0, 4);
+
+  await Promise.all(
+    previewCandidates.map(async (entry) => {
+      try {
+        const raw = await fs.readFile(entry.path, "utf8");
+        if (raw.trim()) {
+          entry.preview = truncateText(raw, 480);
+        }
+      } catch {
+        // Non-fatal
+      }
+    }),
+  );
+
+  return capped;
 }
 
 function formatByteSize(bytes: number | undefined): string {
@@ -1012,6 +1140,20 @@ function toBannerFileLabel(filePath: string, cwd: string): string {
   return path.basename(filePath) || filePath;
 }
 
+function toTranscriptFileDisplay(filePath: string, cwd: string): string {
+  if (cwd) {
+    const rel = path.relative(cwd, filePath);
+    if (rel && !rel.startsWith("..") && !path.isAbsolute(rel)) {
+      return rel;
+    }
+  }
+  const home = os.homedir();
+  if (home && (filePath === home || filePath.startsWith(`${home}${path.sep}`))) {
+    return `~${filePath.slice(home.length)}`;
+  }
+  return filePath;
+}
+
 function buildDeduplicatedFilesTouched(input: {
   cwd: string;
   outputFiles: readonly SessionOutputFile[];
@@ -1037,6 +1179,9 @@ function buildDeduplicatedFilesTouched(input: {
       if (parent && parent !== "." && parent !== "/") {
         label = `${parent}/${label}`;
       }
+    }
+    if (seenLabels.has(label)) {
+      label = toTranscriptFileDisplay(resolved, input.cwd);
     }
     if (seenLabels.has(label)) return;
     seenLabels.add(label);
@@ -1067,6 +1212,45 @@ function buildDeduplicatedFilesTouched(input: {
   }
 
   return labels.slice(0, 40);
+}
+
+function replaceOrAppendMarkdownSection(
+  doc: string,
+  heading: string,
+  newBody: string | null,
+): string {
+  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const sectionRe = new RegExp(`(^|\\n\\n)${escaped}\\n[\\s\\S]*?(?=\\n\\n## |$)`);
+  const replacement = newBody ? `${heading}\n${newBody}` : "";
+  if (sectionRe.test(doc)) {
+    return doc
+      .replace(sectionRe, (_m, lead: string) => (replacement ? `${lead}${replacement}` : ""))
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  }
+  if (!replacement) return doc;
+  // Insert before Conversation sections when possible so state stays near the top
+  const insertBeforeRe = /\n\n## (?:Earlier Session Chain|Initial Task|Earlier Turns Summary|Recent Conversation)/;
+  const idx = doc.search(insertBeforeRe);
+  if (idx >= 0) {
+    return `${doc.slice(0, idx)}\n\n${replacement}${doc.slice(idx)}`;
+  }
+  return `${doc}\n\n${replacement}`;
+}
+
+function upsertHandoffNoteInBriefing(doc: string, cleanNote: string): string {
+  const noteLineRe = /^(\d+\.\s+\*\*User handoff instruction for this switch:\*\*).*$/m;
+  if (noteLineRe.test(doc)) {
+    return doc.replace(noteLineRe, `$1 ${cleanNote}`);
+  }
+  // Insert right after the last numbered rule in the header block
+  const headerEndIdx = doc.indexOf("\n\n## ");
+  const headerPart = headerEndIdx >= 0 ? doc.slice(0, headerEndIdx) : doc;
+  const restPart = headerEndIdx >= 0 ? doc.slice(headerEndIdx) : "";
+  const ruleMatches = [...headerPart.matchAll(/^(\d+)\.\s+/gm)];
+  const nextNum =
+    ruleMatches.length > 0 ? Number(ruleMatches[ruleMatches.length - 1][1]) + 1 : 4;
+  return `${headerPart}\n${nextNum}. **User handoff instruction for this switch:** ${cleanNote}${restPart}`;
 }
 
 function formatTurnDigestLine(turn: CanonicalTurn): string {
@@ -1237,6 +1421,8 @@ function buildFullTranscriptMarkdown(input: {
 
 export function compileContextFromEntries(input: {
   entries: CachedTimelineEntry[];
+  canonical?: CanonicalTurnsResult;
+  timelineTruncated?: boolean;
   git: GitWorkspaceContext;
   cwd: string;
   sourceProvider: string;
@@ -1249,14 +1435,48 @@ export function compileContextFromEntries(input: {
   transcriptPathPlaceholder: string;
 }): CompiledContext {
   const { turns, filesWritten, filesEdited, filesRead, latestTodos, latestPlan } =
-    buildCanonicalTurns(input.entries);
+    input.canonical ?? buildCanonicalTurns(input.entries);
   const outputFiles = input.outputFiles ?? [];
   const cleanNote = input.handoffNote?.trim();
   const isEmptySession =
     turns.length === 0 && outputFiles.length === 0 && !input.ancestor && !cleanNote;
+  const initialTaskAnchor =
+    input.ancestor?.initialTaskAnchor ??
+    (!input.timelineTruncated ? turns[0]?.userText || undefined : undefined);
+
+  const buildWorkspaceStateLines = (markTruncated?: () => void): string[] => {
+    const lines: string[] = [];
+    if (input.git.branch) lines.push(`- Git branch: \`${input.git.branch}\``);
+    if (filesEdited.length > 0) {
+      lines.push(
+        `- Files modified earlier: ${filesEdited.slice(0, 20).map((f) => `\`${f}\``).join(", ")}`,
+      );
+    }
+    if (input.git.statusShort) {
+      lines.push(`- Working tree status:\n\`\`\`\n${input.git.statusShort}\n\`\`\``);
+    }
+    if (input.git.diffStat) {
+      lines.push(`- Uncommitted diff stat:\n\`\`\`\n${input.git.diffStat}\n\`\`\``);
+    }
+    if (input.git.uncommittedPatch && input.settings.includeUncommittedPatch) {
+      lines.push(
+        `- Uncommitted patch preview:\n\`\`\`diff\n${input.git.uncommittedPatch}\n\`\`\``,
+      );
+    }
+    if (latestPlan) {
+      lines.push(`- Latest active plan:\n${truncateText(latestPlan, 1800, markTruncated)}`);
+    }
+    if (latestTodos.length > 0) {
+      lines.push(
+        `- Active task list:\n${latestTodos.map((t) => `  - [${t.completed || t.status === "completed" ? "x" : " "}] ${t.text}`).join("\n")}`,
+      );
+    }
+    return lines;
+  };
 
   // Lossless pass-through when switching back-to-back with 0 new turns on an already-switched session:
-  // carry forward the previous hop's verbatim briefing, previewTurns, and files instead of re-summarizing.
+  // carry forward the previous hop's verbatim briefing while refreshing live workspace state,
+  // output files, and any new handoff note.
   if (turns.length === 0 && input.ancestor && input.ancestor.systemPromptBriefing) {
     const filesTouched = buildDeduplicatedFilesTouched({
       cwd: input.cwd,
@@ -1266,28 +1486,41 @@ export function compileContextFromEntries(input: {
       filesRead,
       ancestorFilesTouched: input.ancestor.filesTouched,
     });
-    const extraSections: string[] = [];
-    if (cleanNote) {
-      extraSections.push(`## Additional Handoff Instruction\n${cleanNote}`);
-    }
-    if (
-      outputFiles.length > 0 &&
-      !input.ancestor.systemPromptBriefing.includes("## Project Output Files & Artifacts")
-    ) {
-      extraSections.push(
-        `## Project Output Files & Artifacts\n${formatOutputFileLines(outputFiles.slice(0, 24), true).join("\n")}`,
+    const transcriptFiles = Array.from(
+      new Set([
+        ...outputFiles.map((f) => toTranscriptFileDisplay(f.path, input.cwd)),
+        ...filesTouched,
+      ]),
+    ).slice(0, 40);
+
+    let systemPromptBriefing = input.ancestor.systemPromptBriefing;
+    const liveWorkspaceLines = buildWorkspaceStateLines();
+    if (liveWorkspaceLines.length > 0) {
+      systemPromptBriefing = replaceOrAppendMarkdownSection(
+        systemPromptBriefing,
+        "## Workspace State",
+        liveWorkspaceLines.join("\n"),
       );
     }
-    const systemPromptBriefing = [input.ancestor.systemPromptBriefing, ...extraSections].join(
-      "\n\n",
-    );
+    if (outputFiles.length > 0) {
+      const outputBlock = formatOutputFileLines(outputFiles.slice(0, 24), true).join("\n");
+      systemPromptBriefing = replaceOrAppendMarkdownSection(
+        systemPromptBriefing,
+        "## Project Output Files & Artifacts",
+        truncateText(outputBlock, 3600),
+      );
+    }
+    if (cleanNote) {
+      systemPromptBriefing = upsertHandoffNoteInBriefing(systemPromptBriefing, cleanNote);
+    }
+
     const transcriptMarkdown = buildFullTranscriptMarkdown({
       sourceProvider: input.sourceProvider,
       sourceModel: input.sourceModel,
       cwd: input.cwd,
       turns,
       git: input.git,
-      filesTouched,
+      filesTouched: transcriptFiles,
       outputFiles,
       latestTodos,
       latestPlan,
@@ -1302,11 +1535,12 @@ export function compileContextFromEntries(input: {
       latestTodos,
       latestPlan,
       isEmptySession: false,
-      hasOmittedHistory: Boolean(input.ancestor.hasOmittedHistory || input.ancestor.totalTurns > 0),
+      hasOmittedHistory: Boolean(input.ancestor.hasOmittedHistory),
       systemPromptBriefing,
       transcriptMarkdown,
       previewTurns: input.ancestor.bannerData?.previewTurns ?? [],
       ancestorSummary: input.ancestor.ancestorSummary ?? "",
+      initialTaskAnchor,
     };
   }
 
@@ -1317,6 +1551,16 @@ export function compileContextFromEntries(input: {
     filesEdited,
     filesRead,
   });
+  const transcriptFiles = Array.from(
+    new Set([
+      ...outputFiles.map((f) => toTranscriptFileDisplay(f.path, input.cwd)),
+      ...filesWritten.map((f) => toTranscriptFileDisplay(normalizeCandidatePath(f, input.cwd) ?? f, input.cwd)),
+      ...filesEdited.map((f) => toTranscriptFileDisplay(normalizeCandidatePath(f, input.cwd) ?? f, input.cwd)),
+      ...filesRead
+        .filter((f) => !isIgnoredMentionedPath(normalizeCandidatePath(f, input.cwd) ?? f))
+        .map((f) => toTranscriptFileDisplay(normalizeCandidatePath(f, input.cwd) ?? f, input.cwd)),
+    ]),
+  ).slice(0, 40);
 
   // CJK-aware char budget so Chinese conversations respect target context windows accurately
   const textSample = turns
@@ -1339,32 +1583,7 @@ export function compileContextFromEntries(input: {
     wasTruncated = true;
   };
 
-  const metaLines: string[] = [];
-  if (input.git.branch) metaLines.push(`- Git branch: \`${input.git.branch}\``);
-  if (filesEdited.length > 0) {
-    metaLines.push(
-      `- Files modified earlier: ${filesEdited.slice(0, 20).map((f) => `\`${f}\``).join(", ")}`,
-    );
-  }
-  if (input.git.statusShort) {
-    metaLines.push(`- Working tree status:\n\`\`\`\n${input.git.statusShort}\n\`\`\``);
-  }
-  if (input.git.diffStat) {
-    metaLines.push(`- Uncommitted diff stat:\n\`\`\`\n${input.git.diffStat}\n\`\`\``);
-  }
-  if (input.git.uncommittedPatch && input.settings.includeUncommittedPatch) {
-    metaLines.push(
-      `- Uncommitted patch preview:\n\`\`\`diff\n${input.git.uncommittedPatch}\n\`\`\``,
-    );
-  }
-  if (latestPlan) {
-    metaLines.push(`- Latest active plan:\n${truncateText(latestPlan, 1800, markTruncated)}`);
-  }
-  if (latestTodos.length > 0) {
-    metaLines.push(
-      `- Active task list:\n${latestTodos.map((t) => `  - [${t.completed || t.status === "completed" ? "x" : " "}] ${t.text}`).join("\n")}`,
-    );
-  }
+  const metaLines = buildWorkspaceStateLines(markTruncated);
 
   const bodySections: string[] = [];
   if (metaLines.length > 0) {
@@ -1384,12 +1603,14 @@ export function compileContextFromEntries(input: {
     );
   }
 
-  // Anchor Turn 1's original task / handoff brief whenever it was pushed out of recentTurnsVerbatim
-  const initialTurn = olderTurns.length > 0 ? olderTurns[0] : null;
-  if (initialTurn && initialTurn.userText) {
+  // Anchor the original root task whenever Turn 1 is omitted (or inherited from a prior hop)
+  const shouldAnchorInitialTask =
+    Boolean(initialTaskAnchor) &&
+    (Boolean(input.ancestor?.initialTaskAnchor) || olderTurns.length > 0);
+  if (shouldAnchorInitialTask && initialTaskAnchor) {
     const anchorBudget = Math.min(4500, Math.floor(budgetChars * 0.25));
     bodySections.push(
-      `## Initial Task / Original Request (Turn 1)\n${truncateText(initialTurn.userText, anchorBudget, markTruncated)}`,
+      `## Initial Task / Original Request (Turn 1)\n${truncateText(initialTaskAnchor, anchorBudget, markTruncated)}`,
     );
   }
 
@@ -1440,6 +1661,7 @@ export function compileContextFromEntries(input: {
 
   const hasOmittedHistory =
     Boolean(input.ancestor) ||
+    Boolean(input.timelineTruncated) ||
     olderTurns.length > 0 ||
     droppedRecent ||
     wasTruncated ||
@@ -1484,7 +1706,7 @@ export function compileContextFromEntries(input: {
         cwd: input.cwd,
         turns,
         git: input.git,
-        filesTouched,
+        filesTouched: transcriptFiles,
         outputFiles,
         latestTodos,
         latestPlan,
@@ -1532,6 +1754,7 @@ export function compileContextFromEntries(input: {
     transcriptMarkdown,
     previewTurns,
     ancestorSummary,
+    initialTaskAnchor,
   };
 }
 

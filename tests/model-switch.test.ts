@@ -12,9 +12,12 @@ import {
   compactToolRecords,
   compileContextFromEntries,
   copyAntigravityBrainFiles,
+  copyPersistedArtifactsToAntigravityBrain,
   estimateCharsPerToken,
   extractAntigravitySessionId,
+  extractMentionedFilePaths,
   isReadPreviousSessionContextPermission,
+  selectSafeAllowPermissionAction,
 } from "../server/context.ts";
 import { mapModeForTargetProvider, resolveModeAndOptionsForTarget } from "../server/mode-map.ts";
 import {
@@ -24,11 +27,16 @@ import {
   pruneOldSwitchArtifacts,
   readAcrossHops,
   recordRecentModel,
+  resolveDefaultHop,
   saveSwitchArtifacts,
   togglePinnedModel,
 } from "../server/storage.ts";
 import { IncrementalTimelineCache } from "../server/turn-cache.ts";
-import { DEFAULT_MODEL_SWITCH_SETTINGS } from "../shared/settings.ts";
+import {
+  DEFAULT_MODEL_SWITCH_SETTINGS,
+  ModelSwitchSettingsSchema,
+  modelSwitchSettings,
+} from "../shared/settings.ts";
 import type { CatalogProvider } from "../shared/contracts.ts";
 
 const SAMPLE_PROVIDERS: CatalogProvider[] = [
@@ -946,5 +954,349 @@ describe("handoff agent_message preservation, initial task anchor, and output fi
     assert.doesNotMatch(hop2.systemPromptBriefing, /No prior turns were recorded/);
     assert.equal(hop2.previewTurns.length, hop1.previewTurns.length);
     assert.deepEqual(hop2.filesTouched, ["warmup.mjs"]);
+    assert.equal(hop2.hasOmittedHistory, false);
+  });
+
+  it("extracts backticked absolute/home/:line paths while ignoring boilerplate and temp attachments", () => {
+    const tmpShot = path.join(os.tmpdir(), "paseo-attachments-abc123", "screen.jpg");
+    const sample = [
+      "See `/tmp/warmup.mjs` and `/tmp/foo/bar.ts:42:10` and `~/docs/report.md`.",
+      "Also `out/deliverable.csv` and `package.json` and `README.md`.",
+      `Temp screenshot: ![img](file://${tmpShot})`,
+      "MCP schema: `/Users/me/.gemini/antigravity-cli/mcp/paseo/create_agent.json`",
+    ].join("\n");
+
+    const paths = extractMentionedFilePaths(sample, "/workspace/proj");
+    assert.ok(paths.includes(path.resolve("/tmp/warmup.mjs")));
+    assert.ok(paths.includes(path.resolve("/tmp/foo/bar.ts")));
+    assert.ok(paths.includes(path.join(os.homedir(), "docs", "report.md")));
+    assert.ok(paths.includes(path.resolve("/workspace/proj/out/deliverable.csv")));
+    assert.ok(!paths.some((p) => p.endsWith("package.json")));
+    assert.ok(!paths.some((p) => p.endsWith("README.md")));
+    assert.ok(!paths.some((p) => p.includes("paseo-attachments-")));
+    assert.ok(!paths.some((p) => p.includes("create_agent.json")));
+  });
+
+  it("prefers allow_once over allow_always, matches ACP title fallback, and ignores failed writes", () => {
+    assert.equal(
+      isReadPreviousSessionContextPermission({
+        kind: "tool",
+        name: "Read Previous Session Context",
+      }),
+      true,
+    );
+    assert.equal(
+      isReadPreviousSessionContextPermission({
+        kind: "tool",
+        name: "Tool",
+        title: "Read Previous Session Context",
+      }),
+      true,
+    );
+
+    const chosen = selectSafeAllowPermissionAction([
+      { id: "allow_always", label: "Always allow MCP server 'paseo'", behavior: "allow" },
+      { id: "allow_once", label: "Allow once", behavior: "allow" },
+      { id: "deny", label: "Deny", behavior: "deny" },
+    ]);
+    assert.equal(chosen?.id, "allow_once");
+
+    const built = buildCanonicalTurns([
+      {
+        seqStart: 1,
+        timestamp: "2026-11-26T04:00:00Z",
+        item: { type: "user_message", text: "Try writing file" },
+      },
+      {
+        seqStart: 2,
+        timestamp: "2026-11-26T04:00:01Z",
+        item: {
+          type: "tool_call",
+          callId: "w-fail",
+          name: "write",
+          status: "failed",
+          error: "EACCES",
+          detail: { type: "write", filePath: "blocked.ts", content: "x" },
+        },
+      },
+      {
+        seqStart: 3,
+        timestamp: "2026-11-26T04:00:02Z",
+        item: {
+          type: "tool_call",
+          callId: "e-cancel",
+          name: "edit",
+          status: "canceled",
+          error: null,
+          detail: { type: "edit", filePath: "aborted.ts", oldString: "a", newString: "b" },
+        },
+      },
+    ]);
+    assert.deepEqual(built.filesWritten, []);
+    assert.deepEqual(built.filesEdited, []);
+  });
+
+  it("preserves agentMessage provenance, merges consecutive pre-reply messages, and carries initialTaskAnchor across hops", () => {
+    const built = buildCanonicalTurns([
+      {
+        seqStart: 1,
+        timestamp: "2026-11-26T04:00:00Z",
+        item: {
+          type: "tool_call",
+          callId: "am-1",
+          name: "agent_message",
+          status: "completed",
+          error: null,
+          agentMessage: {
+            event: "finished",
+            sender: { id: "ag_child", title: "Review Bot" },
+            text: "Found 2 issues in parser.ts",
+          },
+          detail: { type: "plain_text", label: "agent_message", text: "Found 2 issues in parser.ts" },
+        },
+      },
+      {
+        seqStart: 2,
+        timestamp: "2026-11-26T04:00:01Z",
+        item: {
+          type: "tool_call",
+          callId: "am-2",
+          name: "agent_message",
+          status: "completed",
+          error: null,
+          agentMessage: {
+            event: "errored",
+            sender: { id: "ag_lint", title: "Linter" },
+            text: "ESLint timed out",
+          },
+          detail: { type: "plain_text", label: "agent_message", text: "ESLint timed out" },
+        },
+      },
+      {
+        seqStart: 3,
+        timestamp: "2026-11-26T04:00:05Z",
+        item: { type: "assistant_message", text: "Handled both callbacks." },
+      },
+    ]);
+    assert.equal(built.turns.length, 1);
+    assert.match(built.turns[0].userText, /Review Bot/);
+    assert.match(built.turns[0].userText, /finished/);
+    assert.match(built.turns[0].userText, /ESLint timed out/);
+
+    // Multi-hop Turn 1 anchor persists into Hop 2 even after new turns occur
+    const hop2 = compileContextFromEntries({
+      entries: [
+        { seqStart: 1, timestamp: "t1", item: { type: "user_message", text: "Continue task" } },
+        { seqStart: 2, timestamp: "t2", item: { type: "assistant_message", text: "Continuing" } },
+      ],
+      git: { branch: null, statusShort: "", diffStat: "", uncommittedPatch: "" },
+      cwd: "/tmp/repo",
+      sourceProvider: "codex",
+      sourceModel: "gpt-6.2-sol",
+      settings: DEFAULT_MODEL_SWITCH_SETTINGS,
+      ancestor: {
+        switchId: "sw_h1",
+        createdAt: "2026-11-26T04:00:00Z",
+        fromAgentId: "ag_1",
+        fromProvider: "antigravity",
+        fromModel: "gemini-4-neon",
+        toProvider: "codex",
+        toModel: "gpt-6.2-sol",
+        hopCount: 1,
+        totalTurns: 10,
+        turnsCarried: 8,
+        filesTouched: [],
+        gitBranch: null,
+        transcriptPath: "/tmp/h1.md",
+        systemPromptBriefing: "h1",
+        priorTranscriptPaths: [],
+        hops: [],
+        ancestorSummary: "summary",
+        initialTaskAnchor: "ORIGINAL_MISSION_SENTINEL",
+      },
+      transcriptPathPlaceholder: "/tmp/h2.md",
+    });
+    assert.equal(hop2.initialTaskAnchor, "ORIGINAL_MISSION_SENTINEL");
+    assert.match(hop2.systemPromptBriefing, /ORIGINAL_MISSION_SENTINEL/);
+  });
+
+  it("handles 0-turn hop default read, refreshes git/files/note, enforces 0600/0700 perms, and copies persisted brain artifacts", async () => {
+    const tmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "model-switch-review-"));
+    try {
+      const id1 = generateSwitchId();
+      const hop1 = await saveSwitchArtifacts(
+        {
+          record: {
+            switchId: id1,
+            createdAt: "2026-11-26T05:00:00Z",
+            fromAgentId: "ag_1",
+            fromProvider: "antigravity",
+            fromModel: "gemini-4-neon",
+            toProvider: "codex",
+            toModel: "gpt-6.2-sol",
+            hopCount: 1,
+            totalTurns: 4,
+            turnsInSegment: 4,
+            turnsCarried: 4,
+            filesTouched: ["a.ts"],
+            gitBranch: "main",
+            systemPromptBriefing:
+              "[SEAMLESS MODEL SWITCH CONTEXT]\n1. Rule\n2. **User handoff instruction for this switch:** old note\n\n## Workspace State\n- Git branch: `old-branch`\n\n## Project Output Files & Artifacts\n- [created, 10 B] `/tmp/old.md`\n\n## Recent Conversation (Verbatim)\n\n### Turn 1\n**User:** hi",
+            priorTranscriptPaths: [],
+            priorHops: [],
+          },
+          transcriptMarkdown: "# Hop 1\nREAL_HISTORY_TOKEN",
+        },
+        tmpRoot,
+      );
+
+      // Verify restrictive permissions (0o700 dir, 0o600 file)
+      const dirStat = await fs.stat(path.join(tmpRoot, "records"));
+      const fileStat = await fs.stat(path.join(tmpRoot, "records", `${id1}.json`));
+      assert.equal(dirStat.mode & 0o777, 0o700);
+      assert.equal(fileStat.mode & 0o777, 0o600);
+
+      // 0-turn Hop 2 refreshes git branch, output files, and replaces handoff note
+      const compiledHop2 = compileContextFromEntries({
+        entries: [],
+        git: { branch: "feat/new-branch", statusShort: " M a.ts", diffStat: "", uncommittedPatch: "" },
+        cwd: tmpRoot,
+        sourceProvider: "codex",
+        sourceModel: "gpt-6.2-sol",
+        settings: DEFAULT_MODEL_SWITCH_SETTINGS,
+        handoffNote: "new updated note",
+        outputFiles: [{ path: "/tmp/fresh.md", origin: "created", sizeBytes: 42 }],
+        ancestor: hop1,
+        transcriptPathPlaceholder: "/tmp/h2.md",
+      });
+
+      assert.match(compiledHop2.systemPromptBriefing, /feat\/new-branch/);
+      assert.doesNotMatch(compiledHop2.systemPromptBriefing, /old-branch/);
+      assert.match(compiledHop2.systemPromptBriefing, /\/tmp\/fresh\.md/);
+      assert.doesNotMatch(compiledHop2.systemPromptBriefing, /\/tmp\/old\.md/);
+      assert.match(compiledHop2.systemPromptBriefing, /new updated note/);
+      assert.doesNotMatch(compiledHop2.systemPromptBriefing, /old note/);
+
+      const id2 = generateSwitchId();
+      const hop2 = await saveSwitchArtifacts(
+        {
+          record: {
+            switchId: id2,
+            createdAt: "2026-11-26T05:01:00Z",
+            fromAgentId: "ag_2",
+            fromProvider: "codex",
+            fromModel: "gpt-6.2-sol",
+            toProvider: "antigravity",
+            toModel: "gemini-4-neon",
+            hopCount: 2,
+            totalTurns: 4,
+            turnsInSegment: 0,
+            turnsCarried: 4,
+            filesTouched: compiledHop2.filesTouched,
+            gitBranch: "feat/new-branch",
+            systemPromptBriefing: compiledHop2.systemPromptBriefing,
+            priorTranscriptPaths: [hop1.transcriptPath],
+            priorHops: hop1.hops,
+          },
+          transcriptMarkdown: "# Hop 2 (0 turns)",
+        },
+        tmpRoot,
+      );
+
+      assert.equal(resolveDefaultHop(hop2.hops)?.switchId, id1);
+      const readRes = await readAcrossHops(hop2, { action: "read" });
+      assert.match(readRes.text, /REAL_HISTORY_TOKEN/);
+
+      // Persisted artifact copy works even when sourceProvider was codex (round-trip)
+      const brainBase = path.join(tmpRoot, "brain");
+      const srcArtifact = path.join(tmpRoot, "plan.md");
+      await fs.writeFile(srcArtifact, "# Plan", "utf8");
+      const copied = await copyPersistedArtifactsToAntigravityBrain(
+        [{ path: srcArtifact, origin: "artifact", sizeBytes: 6 }],
+        "bbbbbbbb-cccc-dddd-eeee-ffffffffffff",
+        brainBase,
+      );
+      assert.equal(copied.length, 1);
+      assert.equal(
+        await fs.readFile(path.join(brainBase, "bbbbbbbb-cccc-dddd-eeee-ffffffffffff", "plan.md"), "utf8"),
+        "# Plan",
+      );
+
+      // Settings migration sanitizes corrupt legacy values cleanly
+      const migrated = modelSwitchSettings.migrate?.(
+        {
+          recentTurnsVerbatim: 9999,
+          composerTriggerStyle: "invalid-style",
+          archivePreviousAgent: false,
+        },
+        2,
+      );
+      const parsed = ModelSwitchSettingsSchema.safeParse(migrated);
+      assert.equal(parsed.success, true);
+      if (parsed.success) {
+        assert.equal(parsed.data.recentTurnsVerbatim, DEFAULT_MODEL_SWITCH_SETTINGS.recentTurnsVerbatim);
+        assert.equal(parsed.data.composerTriggerStyle, DEFAULT_MODEL_SWITCH_SETTINGS.composerTriggerStyle);
+        assert.equal(parsed.data.archivePreviousAgent, false);
+      }
+    } finally {
+      await fs.rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("fetchFullTimelineWithMeta propagates truncated flag and avoids mislabeling truncated mid-session turn as Turn 1", async () => {
+    const cache = new IncrementalTimelineCache();
+    const fakePaseo = {
+      agents: {
+        ref: () => ({
+          timeline: {
+            refetch: async (opts?: { direction?: string }) => {
+              if (opts?.direction === "tail") {
+                return {
+                  epoch: "ep1",
+                  reset: false,
+                  staleCursor: false,
+                  hasOlder: true,
+                  hasNewer: false,
+                  startCursor: { epoch: "ep1", seq: 10 },
+                  endCursor: { epoch: "ep1", seq: 11 },
+                  entries: [
+                    { seqStart: 10, timestamp: "t10", item: { type: "user_message", text: "MID_SESSION_TURN" } },
+                    { seqStart: 11, timestamp: "t11", item: { type: "assistant_message", text: "reply" } },
+                  ],
+                };
+              }
+              return {
+                epoch: "ep1",
+                reset: false,
+                staleCursor: false,
+                hasOlder: true,
+                hasNewer: false,
+                startCursor: { epoch: "ep1", seq: 8 },
+                endCursor: { epoch: "ep1", seq: 9 },
+                entries: [],
+              };
+            },
+          },
+        }),
+      },
+    } as unknown as PaseoApi;
+
+    const { entries, truncated } = await cache.fetchFullTimelineWithMeta(fakePaseo, "ag_long", 1);
+    assert.equal(truncated, true);
+    assert.equal(entries[0].seqStart, 10);
+
+    const compiled = compileContextFromEntries({
+      entries,
+      timelineTruncated: truncated,
+      git: { branch: null, statusShort: "", diffStat: "", uncommittedPatch: "" },
+      cwd: "/tmp/repo",
+      sourceProvider: "codex",
+      sourceModel: "gpt-6.2-sol",
+      settings: { ...DEFAULT_MODEL_SWITCH_SETTINGS, recentTurnsVerbatim: 1 },
+      transcriptPathPlaceholder: "/tmp/t.md",
+    });
+    assert.equal(compiled.hasOmittedHistory, true);
+    assert.equal(compiled.initialTaskAnchor, undefined);
+    assert.doesNotMatch(compiled.systemPromptBriefing, /## Initial Task \/ Original Request \(Turn 1\)/);
   });
 });

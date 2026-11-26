@@ -187,6 +187,15 @@ export class IncrementalTimelineCache {
     agentId: string,
     maxPages = 8,
   ): Promise<CachedTimelineEntry[]> {
+    const { entries } = await this.fetchFullTimelineWithMeta(paseo, agentId, maxPages);
+    return entries;
+  }
+
+  async fetchFullTimelineWithMeta(
+    paseo: PaseoApi,
+    agentId: string,
+    maxPages = 8,
+  ): Promise<{ entries: CachedTimelineEntry[]; truncated: boolean }> {
     return this.withAgentLock(agentId, async () => {
       const existing = this.cache.get(agentId);
       if (existing?.endCursor) {
@@ -236,11 +245,12 @@ export class IncrementalTimelineCache {
             }
           }
           if (ok) {
+            const truncated = existing.hasOlder;
             const result = Array.from(existing.entriesBySeq.values()).sort(
               (a, b) => a.seqStart - b.seqStart,
             );
             this.trimEntriesIfNeeded(existing);
-            return result;
+            return { entries: result, truncated };
           }
         } catch {
           this.cache.delete(agentId);
@@ -284,6 +294,9 @@ export class IncrementalTimelineCache {
           wholeTurns: true,
           projection: "projected",
         });
+        if (page.reset || page.staleCursor || page.epoch !== epoch) {
+          break;
+        }
         if (page.entries.length === 0) {
           hasOlder = false;
           break;
@@ -298,6 +311,7 @@ export class IncrementalTimelineCache {
         }
       }
 
+      const truncated = hasOlder;
       const result = Array.from(entriesBySeq.values()).sort((a, b) => a.seqStart - b.seqStart);
       const record: AgentTimelineCacheRecord = {
         epoch,
@@ -311,7 +325,7 @@ export class IncrementalTimelineCache {
       this.cache.set(agentId, record);
       this.evictIfNeeded();
 
-      return result;
+      return { entries: result, truncated };
     });
   }
 }

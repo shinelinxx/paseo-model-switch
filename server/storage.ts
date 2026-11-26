@@ -45,6 +45,7 @@ export interface PersistedSwitchRecord {
   priorTranscriptPaths: string[];
   hops: StoredHopEntry[];
   ancestorSummary?: string;
+  initialTaskAnchor?: string;
   bannerData?: SwitchBannerData;
 }
 
@@ -117,7 +118,7 @@ function setCachedPreferences(
 async function ensureDir(dirPath: string): Promise<void> {
   const resolved = path.resolve(dirPath);
   if (initializedDirs.has(resolved)) return;
-  await fs.mkdir(resolved, { recursive: true });
+  await fs.mkdir(resolved, { recursive: true, mode: 0o700 });
   initializedDirs.add(resolved);
 }
 
@@ -155,7 +156,7 @@ function enqueuePrefWrite<T>(rootKey: string, task: () => Promise<T>): Promise<T
 async function writeFileAtomic(filePath: string, content: string): Promise<void> {
   const tmpPath = `${filePath}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
   try {
-    await fs.writeFile(tmpPath, content, "utf8");
+    await fs.writeFile(tmpPath, content, { encoding: "utf8", mode: 0o600 });
     await fs.rename(tmpPath, filePath);
   } catch (error) {
     initializedDirs.delete(path.resolve(path.dirname(filePath)));
@@ -191,10 +192,22 @@ export function assertValidSwitchId(switchId: string): void {
   }
 }
 
+const MAX_BANNER_LINEAGE_HOPS = 24;
+const MAX_BANNER_HANDOFF_NOTE_CHARS = 1500;
+
+export function resolveDefaultHop(hops: readonly StoredHopEntry[]): StoredHopEntry | undefined {
+  if (hops.length === 0) return undefined;
+  for (let i = hops.length - 1; i >= 0; i--) {
+    if (hops[i].turnsInSegment > 0) return hops[i];
+  }
+  return hops[hops.length - 1];
+}
+
 export async function saveSwitchArtifacts(
   input: {
     record: Omit<PersistedSwitchRecord, "transcriptPath" | "hops"> & {
       priorHops: StoredHopEntry[];
+      turnsInSegment?: number;
     };
     transcriptMarkdown: string;
   },
@@ -206,6 +219,7 @@ export async function saveSwitchArtifacts(
   await Promise.all([ensureDir(rDir), ensureDir(tDir)]);
 
   const transcriptPath = path.join(tDir, `${input.record.switchId}.md`);
+  const segmentTurns = input.record.turnsInSegment ?? input.record.totalTurns;
   const currentHop: StoredHopEntry = {
     switchId: input.record.switchId,
     hop: input.record.hopCount,
@@ -215,12 +229,21 @@ export async function saveSwitchArtifacts(
     toProvider: input.record.toProvider,
     toModel: input.record.toModel,
     createdAt: input.record.createdAt,
-    turnsInSegment: input.record.totalTurns,
+    turnsInSegment: segmentTurns,
     transcriptPath,
   };
 
-  const { priorHops, ...rest } = input.record;
+  const { priorHops, turnsInSegment: _tis, ...rest } = input.record;
   const hops = [...priorHops, currentHop];
+  const defaultHop = resolveDefaultHop(hops) ?? currentHop;
+  const cappedLineage = hops
+    .slice(-MAX_BANNER_LINEAGE_HOPS)
+    .map(({ transcriptPath: _tp, ...pub }) => pub);
+  const safeBannerNote =
+    rest.bannerData?.handoffNote &&
+    rest.bannerData.handoffNote.length > MAX_BANNER_HANDOFF_NOTE_CHARS
+      ? `${rest.bannerData.handoffNote.slice(0, MAX_BANNER_HANDOFF_NOTE_CHARS - 1)}…`
+      : rest.bannerData?.handoffNote;
 
   const fullRecord: PersistedSwitchRecord = {
     ...rest,
@@ -229,8 +252,9 @@ export async function saveSwitchArtifacts(
     bannerData: rest.bannerData
       ? {
           ...rest.bannerData,
-          transcriptPath,
-          lineage: hops.map(({ transcriptPath: _tp, ...pub }) => pub),
+          handoffNote: safeBannerNote,
+          transcriptPath: defaultHop.transcriptPath,
+          lineage: cappedLineage,
         }
       : undefined,
   };
@@ -547,7 +571,7 @@ export async function readAcrossHops(
   const targetHop =
     typeof options.hop === "number"
       ? hops.find((h) => h.hop === options.hop)
-      : hops[hops.length - 1];
+      : resolveDefaultHop(hops);
 
   if (!targetHop) {
     return {

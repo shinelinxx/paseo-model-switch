@@ -34,12 +34,15 @@ import {
   type ModelSwitchSettingsSchema,
 } from "../shared/settings";
 import {
+  buildCanonicalTurns,
   collectGitWorkspaceContext,
   collectSessionOutputFiles,
   compileContextFromEntries,
-  copyAntigravityBrainFiles,
+  copyPersistedArtifactsToAntigravityBrain,
   isReadPreviousSessionContextPermission,
   READ_CONTEXT_TOOL_NAME,
+  READ_CONTEXT_TOOL_TITLE,
+  selectSafeAllowPermissionAction,
 } from "./context";
 import { resolveModeAndOptionsForTarget } from "./mode-map";
 import {
@@ -50,6 +53,7 @@ import {
   readAcrossHops,
   readTranscriptSlice,
   recordRecentModel,
+  resolveDefaultHop,
   saveSwitchArtifacts,
   togglePinnedModel,
 } from "./storage";
@@ -476,16 +480,17 @@ export async function handleSwitchModel(
 
   const ancestorSwitchId = readStringMeta(sourceAgent.metadata, sourceAgent.labels, SWITCH_META_KEY);
 
-  const [targetProviderEntry, ancestor, entries, git] = await Promise.all([
+  const [targetProviderEntry, ancestor, timelineResult, git] = await Promise.all([
     resolveTargetProvider(paseo, input.targetProvider, cwd),
     ancestorSwitchId ? loadSwitchRecord(ancestorSwitchId) : Promise.resolve(null),
-    turnCache.fetchFullTimeline(paseo, sourceAgent.id),
+    turnCache.fetchFullTimelineWithMeta(paseo, sourceAgent.id),
     collectGitWorkspaceContext(
       cwd,
       settings.includeGitContext,
       settings.includeUncommittedPatch,
     ),
   ]);
+  const { entries, truncated: timelineTruncated } = timelineResult;
 
   if (!targetProviderEntry) {
     throw new Error(`目标 Provider 不可用或未就绪: ${input.targetProvider}`);
@@ -501,9 +506,12 @@ export async function handleSwitchModel(
   const sourceSessionId =
     sourceAgent.persistence?.sessionId ?? sourceAgent.runtimeInfo?.sessionId ?? null;
 
+  const canonical = buildCanonicalTurns(entries);
+
   const outputFiles = await collectSessionOutputFiles({
     cwd,
     entries,
+    canonical,
     gitStatusShort: git.statusShort,
     sourceProvider,
     sourceSessionId,
@@ -512,6 +520,8 @@ export async function handleSwitchModel(
 
   const compiled = compileContextFromEntries({
     entries,
+    canonical,
+    timelineTruncated,
     git,
     cwd,
     sourceProvider,
@@ -561,6 +571,7 @@ export async function handleSwitchModel(
   let savedTranscriptPath = "";
   let savedBannerData: SwitchBannerData | undefined;
   let turnsCarried = 0;
+  let effectiveTotalTurns = compiled.turns.length;
 
   const recordRecentTask = recordRecentModel({
     provider: input.targetProvider,
@@ -577,7 +588,7 @@ export async function handleSwitchModel(
     ];
 
     const isZeroTurnPassthrough = compiled.turns.length === 0 && Boolean(ancestor);
-    const effectiveTotalTurns = isZeroTurnPassthrough
+    effectiveTotalTurns = isZeroTurnPassthrough
       ? (ancestor?.totalTurns ?? 0)
       : compiled.turns.length;
     turnsCarried = isZeroTurnPassthrough
@@ -613,7 +624,8 @@ export async function handleSwitchModel(
           toProvider: input.targetProvider,
           toModel: resolvedTargetModel,
           hopCount,
-          totalTurns: compiled.turns.length,
+          totalTurns: effectiveTotalTurns,
+          turnsInSegment: compiled.turns.length,
           turnsCarried,
           hasOmittedHistory: compiled.hasOmittedHistory,
           filesTouched: compiled.filesTouched,
@@ -624,6 +636,7 @@ export async function handleSwitchModel(
           priorTranscriptPaths,
           priorHops: ancestor?.hops ?? [],
           ancestorSummary: compiled.ancestorSummary,
+          initialTaskAnchor: compiled.initialTaskAnchor,
           bannerData: baseBannerData,
         },
         transcriptMarkdown: compiled.transcriptMarkdown,
@@ -631,7 +644,7 @@ export async function handleSwitchModel(
       recordRecentTask,
     ]);
 
-    savedTranscriptPath = savedRecord.transcriptPath;
+    savedTranscriptPath = savedRecord.bannerData?.transcriptPath ?? savedRecord.transcriptPath;
     savedBannerData = savedRecord.bannerData;
     nextLabels[SWITCH_META_KEY] = switchId;
     nextMetadata[SWITCH_META_KEY] = switchId;
@@ -703,10 +716,11 @@ export async function handleSwitchModel(
         })()
       : Promise.resolve({ archivedPrevious: false });
 
+  const hasBrainArtifacts = compiled.outputFiles.some(
+    (f) => f.origin === "artifact" || f.origin === "scratch" || f.origin === "uploaded",
+  );
   const brainCopyTask =
-    sourceProvider === "antigravity" &&
-    input.targetProvider === "antigravity" &&
-    sourceSessionId
+    input.targetProvider === "antigravity" && hasBrainArtifacts
       ? (async () => {
           try {
             const refreshedNew = await newAgentHandle.refresh().catch(() => null);
@@ -717,7 +731,10 @@ export async function handleSwitchModel(
               newAgentHandle.current()?.runtimeInfo?.sessionId ??
               null;
             if (targetSessionId) {
-              await copyAntigravityBrainFiles(sourceSessionId, targetSessionId);
+              await copyPersistedArtifactsToAntigravityBrain(
+                compiled.outputFiles,
+                targetSessionId,
+              );
             }
           } catch (error) {
             console.error("[model-switch] Failed to copy Antigravity brain artifacts:", error);
@@ -737,7 +754,7 @@ export async function handleSwitchModel(
     provider: input.targetProvider,
     model: resolvedTargetModel,
     turnsCarried,
-    totalTurns: compiled.turns.length,
+    totalTurns: effectiveTotalTurns,
     archivedPrevious,
     archiveSkippedReason,
     modeMapped: mappedModeId ?? null,
@@ -753,7 +770,7 @@ export async function handleGetSwitchRecord(
 
   const targetHop = input.hopSwitchId
     ? record.hops.find((h) => h.switchId === input.hopSwitchId)
-    : record.hops[record.hops.length - 1];
+    : resolveDefaultHop(record.hops);
   const targetPath = targetHop?.transcriptPath ?? record.transcriptPath;
   const publicLineage = record.hops.map(({ transcriptPath: _tp, ...pub }) => pub);
 
@@ -820,6 +837,7 @@ export function registerSessionOpenHook(
   settingsHandle: PluginSettings<typeof ModelSwitchSettingsSchema>,
 ): () => void {
   const pendingTimers = new Set<ReturnType<typeof setTimeout>>();
+  const syncedBrainAgents = new Set<string>();
   let disposed = false;
 
   const removeOpenHook = server.addHook("agent.open.before", async ({ request }, { paseo }) => {
@@ -850,7 +868,7 @@ export function registerSessionOpenHook(
     if (shouldAttachTool) {
       const readerTool = defineAgentTool({
         name: READ_CONTEXT_TOOL_NAME,
-        title: "Read Previous Session Context",
+        title: READ_CONTEXT_TOOL_TITLE,
         description:
           "Inspect or search full verbatim conversation transcripts from before this session switched models (supports multi-hop chains). Use action='list_hops' to view all prior model segments, action='search' with query and optional hop='all', or action='read' with offset/limit.",
         input: READ_PREVIOUS_SESSION_CONTEXT_INPUT_SCHEMA,
@@ -876,6 +894,32 @@ export function registerSessionOpenHook(
     };
   });
 
+  // Ensure lazy Antigravity session brain directories receive persisted artifacts on first turn
+  const removeTurnHook = server.addHook("agent.turn.before", async ({ agent }, { paseo }) => {
+    if (disposed || agent.provider !== "antigravity" || syncedBrainAgents.has(agent.id)) return;
+    const switchId = readStringMeta(agent.metadata, undefined, SWITCH_META_KEY);
+    if (!switchId) return;
+    syncedBrainAgents.add(agent.id);
+    if (syncedBrainAgents.size > 256) {
+      const first = syncedBrainAgents.values().next().value;
+      if (first) syncedBrainAgents.delete(first);
+    }
+    try {
+      const record = await loadSwitchRecord(switchId);
+      if (!record?.outputFiles || record.outputFiles.length === 0) return;
+      const refreshed = await paseo.agents.ref(agent.id).refresh().catch(() => null);
+      const targetSessionId =
+        refreshed?.agent.persistence?.sessionId ??
+        refreshed?.agent.runtimeInfo?.sessionId ??
+        null;
+      if (targetSessionId) {
+        await copyPersistedArtifactsToAntigravityBrain(record.outputFiles, targetSessionId);
+      }
+    } catch {
+      // Non-fatal
+    }
+  });
+
   // Auto-approve our own read-only transcript reader tool on switched agents.
   // Paseo's `toolPolicy.preapproved` only permits MCP servers explicitly passed in `config.mcpServers`
   // of the same create request (not the built-in `paseo` server or providers without exact preapproval),
@@ -887,7 +931,7 @@ export function registerSessionOpenHook(
       if (!isReadPreviousSessionContextPermission(request)) return;
       if (!readStringMeta(agent.metadata, undefined, SWITCH_META_KEY)) return;
 
-      const allowAction = request.actions?.find((action) => action.behavior === "allow");
+      const allowAction = selectSafeAllowPermissionAction(request.actions);
       try {
         await paseo.agents.ref(agent.id).respondToPermission({
           requestId: request.id,
@@ -908,7 +952,9 @@ export function registerSessionOpenHook(
       clearTimeout(timer);
     }
     pendingTimers.clear();
+    syncedBrainAgents.clear();
     removePermissionHook();
+    removeTurnHook();
     removeOpenHook();
   };
 }

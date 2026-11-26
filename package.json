@@ -1,6 +1,7 @@
 {
   "name": "paseo-model-switch",
   "private": true,
+  "type": "module",
   "version": "0.6.0",
   "description": "Seamless mid-session and cross-provider model switching plugin for Paseo with silent context handoff, multi-hop transcript search, and minimal UI footprint.",
   "license": "MIT",

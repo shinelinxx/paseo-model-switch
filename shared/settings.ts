@@ -42,9 +42,20 @@ export const modelSwitchSettings = defineSettings({
   version: 3,
   schema: ModelSwitchSettingsSchema,
   migrate(values) {
-    if (values && typeof values === "object") {
-      return { ...DEFAULT_MODEL_SWITCH_SETTINGS, ...(values as Record<string, unknown>) };
+    if (!values || typeof values !== "object") {
+      return DEFAULT_MODEL_SWITCH_SETTINGS;
     }
-    return DEFAULT_MODEL_SWITCH_SETTINGS;
+    const raw = values as Record<string, unknown>;
+    const shape = ModelSwitchSettingsSchema.shape;
+    const sanitized: Record<string, unknown> = { ...DEFAULT_MODEL_SWITCH_SETTINGS };
+    for (const key of Object.keys(shape) as Array<keyof ModelSwitchSettings>) {
+      if (raw[key] !== undefined) {
+        const parsed = shape[key].safeParse(raw[key]);
+        if (parsed.success) {
+          sanitized[key] = parsed.data;
+        }
+      }
+    }
+    return sanitized as ModelSwitchSettings;
   },
 });

@@ -51,13 +51,22 @@ const SwitchBannerExpandedBody = memo(function SwitchBannerExpandedBody({
     status: a.status,
   }));
 
-  const [activeHopId, setActiveHopId] = useState<string>(data.switchId);
+  const lineage: readonly LineageHop[] = data.lineage ?? EMPTY_LINEAGE;
+  const defaultHopId = useMemo(() => {
+    for (let i = lineage.length - 1; i >= 0; i--) {
+      if (lineage[i].turnsInSegment > 0) return lineage[i].switchId;
+    }
+    return data.switchId;
+  }, [lineage, data.switchId]);
+
+  const [activeHopId, setActiveHopId] = useState<string>(defaultHopId);
   const [searchQuery, setSearchQuery] = useState("");
   const [transcriptText, setTranscriptText] = useState<string | null>(null);
   const [loadingTranscript, setLoadingTranscript] = useState(false);
   const [switchingBack, setSwitchingBack] = useState(false);
 
   const mountedRef = useRef(true);
+  const transcriptRequestSeqRef = useRef(0);
   const transcriptCacheRef = useRef<Map<string, string>>(new Map());
 
   useEffect(() => {
@@ -66,8 +75,6 @@ const SwitchBannerExpandedBody = memo(function SwitchBannerExpandedBody({
       mountedRef.current = false;
     };
   }, []);
-
-  const lineage: readonly LineageHop[] = data.lineage ?? EMPTY_LINEAGE;
 
   const styles = useMemo(
     () => ({
@@ -205,13 +212,14 @@ const SwitchBannerExpandedBody = memo(function SwitchBannerExpandedBody({
 
   const fetchHopTranscript = useCallback(
     async (hopSwitchId: string, query?: string) => {
-      if (loadingTranscript) return;
       const normalizedQuery = query?.trim() || "";
       const cacheKey = `${hopSwitchId}\0${normalizedQuery}`;
+      const seq = ++transcriptRequestSeqRef.current;
       const cached = transcriptCacheRef.current.get(cacheKey);
       if (cached !== undefined) {
         setActiveHopId(hopSwitchId);
         setTranscriptText(cached);
+        setLoadingTranscript(false);
         return;
       }
 
@@ -223,8 +231,8 @@ const SwitchBannerExpandedBody = memo(function SwitchBannerExpandedBody({
           hopSwitchId,
           query: normalizedQuery || undefined,
         });
-        if (!mountedRef.current) return;
-        if (res.found && res.transcriptPreview) {
+        if (!mountedRef.current || seq !== transcriptRequestSeqRef.current) return;
+        if (res.found && res.transcriptPreview !== undefined) {
           const cache = transcriptCacheRef.current;
           if (cache.size >= MAX_TRANSCRIPT_CACHE_ENTRIES) {
             const oldestKey = cache.keys().next().value;
@@ -236,16 +244,16 @@ const SwitchBannerExpandedBody = memo(function SwitchBannerExpandedBody({
           toast.show("未找到本地完整记录文件", { variant: "warning" });
         }
       } catch {
-        if (mountedRef.current) {
+        if (mountedRef.current && seq === transcriptRequestSeqRef.current) {
           toast.error("读取历史记录失败");
         }
       } finally {
-        if (mountedRef.current) {
+        if (mountedRef.current && seq === transcriptRequestSeqRef.current) {
           setLoadingTranscript(false);
         }
       }
     },
-    [loadingTranscript, loadRecord, data.switchId, toast],
+    [loadRecord, data.switchId, toast],
   );
 
   const handleSwitchBack = useCallback(async () => {
