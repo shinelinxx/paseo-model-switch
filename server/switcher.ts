@@ -35,7 +35,9 @@ import {
 } from "../shared/settings";
 import {
   collectGitWorkspaceContext,
+  collectSessionOutputFiles,
   compileContextFromEntries,
+  copyAntigravityBrainFiles,
   isReadPreviousSessionContextPermission,
   READ_CONTEXT_TOOL_NAME,
 } from "./context";
@@ -496,6 +498,17 @@ export async function handleSwitchModel(
   const switchId = generateSwitchId();
   const plannedTranscriptPath = path.join(getDataRoot(), "transcripts", `${switchId}.md`);
   const cleanNote = input.handoffNote?.trim() || undefined;
+  const sourceSessionId =
+    sourceAgent.persistence?.sessionId ?? sourceAgent.runtimeInfo?.sessionId ?? null;
+
+  const outputFiles = await collectSessionOutputFiles({
+    cwd,
+    entries,
+    gitStatusShort: git.statusShort,
+    sourceProvider,
+    sourceSessionId,
+    ancestorOutputFiles: ancestor?.outputFiles,
+  });
 
   const compiled = compileContextFromEntries({
     entries,
@@ -507,6 +520,7 @@ export async function handleSwitchModel(
     settings,
     handoffNote: cleanNote,
     ancestor,
+    outputFiles,
     transcriptPathPlaceholder: plannedTranscriptPath,
   });
 
@@ -597,6 +611,7 @@ export async function handleSwitchModel(
           turnsCarried,
           hasOmittedHistory: compiled.hasOmittedHistory,
           filesTouched: compiled.filesTouched,
+          outputFiles: compiled.outputFiles,
           gitBranch: compiled.git.branch,
           systemPromptBriefing: compiled.systemPromptBriefing,
           handoffNote: cleanNote,
@@ -682,7 +697,29 @@ export async function handleSwitchModel(
         })()
       : Promise.resolve({ archivedPrevious: false });
 
-  const [, archiveResult] = await Promise.all([bannerTask, archiveTask]);
+  const brainCopyTask =
+    sourceProvider === "antigravity" &&
+    input.targetProvider === "antigravity" &&
+    sourceSessionId
+      ? (async () => {
+          try {
+            const refreshedNew = await newAgentHandle.refresh().catch(() => null);
+            const targetSessionId =
+              refreshedNew?.agent.persistence?.sessionId ??
+              refreshedNew?.agent.runtimeInfo?.sessionId ??
+              newAgentHandle.current()?.persistence?.sessionId ??
+              newAgentHandle.current()?.runtimeInfo?.sessionId ??
+              null;
+            if (targetSessionId) {
+              await copyAntigravityBrainFiles(sourceSessionId, targetSessionId);
+            }
+          } catch (error) {
+            console.error("[model-switch] Failed to copy Antigravity brain artifacts:", error);
+          }
+        })()
+      : Promise.resolve();
+
+  const [, archiveResult] = await Promise.all([bannerTask, archiveTask, brainCopyTask]);
   const { archivedPrevious, archiveSkippedReason } = archiveResult;
 
   return {

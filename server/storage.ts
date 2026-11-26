@@ -8,6 +8,21 @@ export interface StoredHopEntry extends LineageHop {
   transcriptPath: string;
 }
 
+export type OutputFileOrigin =
+  | "created"
+  | "modified"
+  | "artifact"
+  | "scratch"
+  | "uploaded"
+  | "referenced";
+
+export interface SessionOutputFile {
+  path: string;
+  origin: OutputFileOrigin;
+  sizeBytes?: number;
+  preview?: string;
+}
+
 export interface PersistedSwitchRecord {
   switchId: string;
   createdAt: string;
@@ -22,6 +37,7 @@ export interface PersistedSwitchRecord {
   turnsCarried: number;
   hasOmittedHistory?: boolean;
   filesTouched: string[];
+  outputFiles?: SessionOutputFile[];
   gitBranch: string | null;
   transcriptPath: string;
   systemPromptBriefing: string;

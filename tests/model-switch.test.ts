@@ -8,9 +8,12 @@ import type { AgentTimelineItem } from "@getpaseo/protocol/agent-types";
 import { resolveTargetFromSlashArgs } from "../client/switch-runner.ts";
 import {
   buildCanonicalTurns,
+  collectSessionOutputFiles,
   compactToolRecords,
   compileContextFromEntries,
+  copyAntigravityBrainFiles,
   estimateCharsPerToken,
+  extractAntigravitySessionId,
   isReadPreviousSessionContextPermission,
 } from "../server/context.ts";
 import { mapModeForTargetProvider, resolveModeAndOptionsForTarget } from "../server/mode-map.ts";
@@ -662,5 +665,181 @@ describe("permission hook matcher for read_previous_session_context", () => {
       isReadPreviousSessionContextPermission({ kind: "tool", name: "read_previous_session_context_extra" }),
       false,
     );
+  });
+});
+
+describe("handoff agent_message preservation, initial task anchor, and output files", () => {
+  it("preserves full agent_message handoff prompt in transcript and anchors Turn 1 when pushed out of verbatim window", () => {
+    const handoffPrompt = [
+      "## Task",
+      "Sign in to bringingchichi@gmail.com in AdsPower profile k1fimixy.",
+      "## Relevant files",
+      "- `/tmp/warmup.mjs`",
+      "## Acceptance criteria",
+      "- Run warmup.mjs and report Country Version and Schedule 127cc083.",
+    ].join("\n");
+
+    const entries: Array<{ item: AgentTimelineItem; timestamp: string; seqStart: number }> = [
+      {
+        seqStart: 1,
+        timestamp: "2026-11-26T03:37:00Z",
+        item: {
+          type: "tool_call",
+          callId: "msg-1",
+          name: "agent_message",
+          status: "completed",
+          error: null,
+          detail: {
+            type: "plain_text",
+            label: "agent_message",
+            text: handoffPrompt,
+          },
+        },
+      },
+      {
+        seqStart: 2,
+        timestamp: "2026-11-26T03:37:30Z",
+        item: { type: "assistant_message", text: "Paused at reCAPTCHA." },
+      },
+    ];
+
+    for (let i = 2; i <= 10; i++) {
+      entries.push({
+        seqStart: i * 2,
+        timestamp: `2026-11-26T03:${String(i).padStart(2, "0")}:00Z`,
+        item: { type: "user_message", text: `Follow-up ${i}` },
+      });
+      entries.push({
+        seqStart: i * 2 + 1,
+        timestamp: `2026-11-26T03:${String(i).padStart(2, "0")}:10Z`,
+        item: { type: "assistant_message", text: `Reply ${i}` },
+      });
+    }
+
+    const compiled = compileContextFromEntries({
+      entries,
+      git: { branch: null, statusShort: "", diffStat: "", uncommittedPatch: "" },
+      cwd: "/tmp/repo",
+      sourceProvider: "codex",
+      sourceModel: "gpt-6.2-sol",
+      settings: { ...DEFAULT_MODEL_SWITCH_SETTINGS, recentTurnsVerbatim: 8 },
+      transcriptPathPlaceholder: "/tmp/t.md",
+    });
+
+    assert.equal(compiled.turns.length, 10);
+    assert.match(compiled.turns[0].userText, /Schedule 127cc083/);
+    assert.match(compiled.transcriptMarkdown, /Schedule 127cc083/);
+    assert.match(compiled.systemPromptBriefing, /## Initial Task \/ Original Request \(Turn 1\)/);
+    assert.match(compiled.systemPromptBriefing, /Schedule 127cc083/);
+  });
+
+  it("collects created/modified/git/mentioned/brain output files and copies Antigravity brain artifacts", async () => {
+    const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "model-switch-outputs-"));
+    try {
+      const workspaceDir = path.join(tmpDir, "workspace");
+      const brainBase = path.join(tmpDir, "brain");
+      const srcSessionUuid = "11111111-2222-3333-4444-555555555555";
+      const dstSessionUuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+      const srcBrainDir = path.join(brainBase, srcSessionUuid);
+
+      await fs.mkdir(path.join(workspaceDir, "out"), { recursive: true });
+      await fs.mkdir(path.join(srcBrainDir, "scratch"), { recursive: true });
+      await fs.mkdir(path.join(srcBrainDir, ".system_generated"), { recursive: true });
+
+      const writtenFile = path.join(workspaceDir, "out", "report.md");
+      const gitUntrackedFile = path.join(workspaceDir, "out", "summary.csv");
+      const mentionedRelFile = path.join(workspaceDir, "out", "chart.png");
+      const artifactFile = path.join(srcBrainDir, "implementation_plan.md");
+      const scratchFile = path.join(srcBrainDir, "scratch", "helper.py");
+      const ignoredSysFile = path.join(srcBrainDir, ".system_generated", "transcript.jsonl");
+
+      await Promise.all([
+        fs.writeFile(writtenFile, "# Report\nDone", "utf8"),
+        fs.writeFile(gitUntrackedFile, "col1,col2\n1,2\n", "utf8"),
+        fs.writeFile(mentionedRelFile, "PNGDATA", "utf8"),
+        fs.writeFile(artifactFile, "# Implementation Plan\nStep 1: ship it.", "utf8"),
+        fs.writeFile(scratchFile, "print('ok')\n", "utf8"),
+        fs.writeFile(ignoredSysFile, "{}\n", "utf8"),
+      ]);
+
+      const entries: Array<{ item: AgentTimelineItem; timestamp: string; seqStart: number }> = [
+        {
+          seqStart: 1,
+          timestamp: "2026-11-26T04:00:00Z",
+          item: { type: "user_message", text: "Generate the project deliverables." },
+        },
+        {
+          seqStart: 2,
+          timestamp: "2026-11-26T04:00:05Z",
+          item: {
+            type: "tool_call",
+            callId: "w1",
+            name: "write",
+            status: "completed",
+            error: null,
+            detail: { type: "write", filePath: "out/report.md", content: "# Report\nDone" },
+          },
+        },
+        {
+          seqStart: 3,
+          timestamp: "2026-11-26T04:00:10Z",
+          item: {
+            type: "assistant_message",
+            text: `Generated \`out/chart.png\` and [report](file://${writtenFile}).`,
+          },
+        },
+      ];
+
+      const wrappedSessionId = `plugin:${JSON.stringify({ version: 1, data: { sessionId: srcSessionUuid } })}`;
+      assert.equal(extractAntigravitySessionId(wrappedSessionId), srcSessionUuid);
+
+      const outputFiles = await collectSessionOutputFiles({
+        cwd: workspaceDir,
+        entries,
+        gitStatusShort: "?? out/summary.csv\n",
+        sourceProvider: "antigravity",
+        sourceSessionId: wrappedSessionId,
+        brainBaseDir: brainBase,
+      });
+
+      const byPath = new Map(outputFiles.map((f) => [f.path, f]));
+      assert.equal(byPath.get(writtenFile)?.origin, "created");
+      assert.equal(byPath.get(gitUntrackedFile)?.origin, "created");
+      assert.equal(byPath.get(mentionedRelFile)?.origin, "referenced");
+      assert.equal(byPath.get(artifactFile)?.origin, "artifact");
+      assert.match(byPath.get(artifactFile)?.preview ?? "", /Implementation Plan/);
+      assert.equal(byPath.get(scratchFile)?.origin, "scratch");
+      assert.equal(byPath.has(ignoredSysFile), false);
+
+      const compiled = compileContextFromEntries({
+        entries,
+        git: { branch: "main", statusShort: "?? out/summary.csv", diffStat: "", uncommittedPatch: "" },
+        cwd: workspaceDir,
+        sourceProvider: "antigravity",
+        sourceModel: "gemini-4-neon",
+        settings: DEFAULT_MODEL_SWITCH_SETTINGS,
+        outputFiles,
+        transcriptPathPlaceholder: "/tmp/t.md",
+      });
+
+      assert.match(compiled.systemPromptBriefing, /## Project Output Files & Artifacts/);
+      assert.match(compiled.systemPromptBriefing, /out\/report\.md/);
+      assert.match(compiled.systemPromptBriefing, /out\/summary\.csv/);
+      assert.match(compiled.systemPromptBriefing, /implementation_plan\.md/);
+      assert.match(compiled.transcriptMarkdown, /## Project Output Files & Artifacts/);
+
+      const copied = await copyAntigravityBrainFiles(wrappedSessionId, dstSessionUuid, brainBase);
+      assert.equal(copied.length, 2);
+      const copiedArtifact = await fs.readFile(
+        path.join(brainBase, dstSessionUuid, "implementation_plan.md"),
+        "utf8",
+      );
+      assert.match(copiedArtifact, /Step 1: ship it/);
+      await assert.rejects(
+        fs.stat(path.join(brainBase, dstSessionUuid, ".system_generated", "transcript.jsonl")),
+      );
+    } finally {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
   });
 });
