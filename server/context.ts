@@ -123,9 +123,9 @@ export function compactToolRecords(
   }
 
   const highPriority: ToolSummaryRecord[] = [];
-  const readTargets: string[] = [];
-  const searchTargets: string[] = [];
-  const fetchTargets: string[] = [];
+  const readTargets = new Set<string>();
+  const searchTargets = new Set<string>();
+  const fetchTargets = new Set<string>();
   const otherSummaries: string[] = [];
 
   for (const r of records) {
@@ -140,11 +140,11 @@ export function compactToolRecords(
     ) {
       highPriority.push(r);
     } else if (r.kind === "read") {
-      if (r.target && !readTargets.includes(r.target)) readTargets.push(r.target);
+      if (r.target) readTargets.add(r.target);
     } else if (r.kind === "search") {
-      if (r.target && !searchTargets.includes(r.target)) searchTargets.push(r.target);
+      if (r.target) searchTargets.add(r.target);
     } else if (r.kind === "fetch") {
-      if (r.target && !fetchTargets.includes(r.target)) fetchTargets.push(r.target);
+      if (r.target) fetchTargets.add(r.target);
     } else {
       otherSummaries.push(r.summary);
     }
@@ -152,18 +152,21 @@ export function compactToolRecords(
 
   const out: string[] = [];
   const groupedExtras: string[] = [];
-  if (readTargets.length > 0) {
-    const shown = readTargets.slice(0, 6).join(", ");
-    const more = readTargets.length > 6 ? `, +${readTargets.length - 6} more` : "";
-    groupedExtras.push(`read ${readTargets.length} file(s): ${shown}${more}`);
+  if (readTargets.size > 0) {
+    const readList = Array.from(readTargets);
+    const shown = readList.slice(0, 6).join(", ");
+    const more = readList.length > 6 ? `, +${readList.length - 6} more` : "";
+    groupedExtras.push(`read ${readList.length} file(s): ${shown}${more}`);
   }
-  if (searchTargets.length > 0) {
-    const shown = searchTargets.slice(0, 4).map((q) => `"${q}"`).join(", ");
-    const more = searchTargets.length > 4 ? `, +${searchTargets.length - 4} more` : "";
-    groupedExtras.push(`search ×${searchTargets.length}: ${shown}${more}`);
+  if (searchTargets.size > 0) {
+    const searchList = Array.from(searchTargets);
+    const shown = searchList.slice(0, 4).map((q) => `"${q}"`).join(", ");
+    const more = searchList.length > 4 ? `, +${searchList.length - 4} more` : "";
+    groupedExtras.push(`search ×${searchList.length}: ${shown}${more}`);
   }
-  if (fetchTargets.length > 0) {
-    groupedExtras.push(`fetch ×${fetchTargets.length}: ${fetchTargets.slice(0, 3).join(", ")}`);
+  if (fetchTargets.size > 0) {
+    const fetchList = Array.from(fetchTargets);
+    groupedExtras.push(`fetch ×${fetchList.length}: ${fetchList.slice(0, 3).join(", ")}`);
   }
 
   const reserveForGroups = Math.min(groupedExtras.length, 3);
@@ -377,6 +380,8 @@ export function buildCanonicalTurns(
     ) {
       return;
     }
+    for (const f of current.filesEdited) allEdited.add(f);
+    for (const f of current.filesRead) allRead.add(f);
     turns.push({
       index: turns.length + 1,
       timestamp: current.timestamp,
@@ -460,8 +465,6 @@ export function buildCanonicalTurns(
         );
         t.toolRecords.push(record);
         t.toolSummaries.push(record.summary);
-        for (const f of t.filesEdited) allEdited.add(f);
-        for (const f of t.filesRead) allRead.add(f);
         break;
       }
       case "todo": {
@@ -512,15 +515,25 @@ export async function collectGitWorkspaceContext(
   if (!includeGit || !cwd) {
     return { branch: null, statusShort: "", diffStat: "", uncommittedPatch: "" };
   }
-  const [branch, statusShort, diffStat, diffPatch] = await Promise.all([
+  const [branch, statusShort] = await Promise.all([
     runGit(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]),
     runGit(cwd, ["status", "--short"]),
+  ]);
+  if (!branch || !statusShort) {
+    return {
+      branch: branch || null,
+      statusShort: statusShort ? truncateText(statusShort, 1600) : "",
+      diffStat: "",
+      uncommittedPatch: "",
+    };
+  }
+  const [diffStat, diffPatch] = await Promise.all([
     runGit(cwd, ["diff", "--stat"]),
     includePatch ? runGit(cwd, ["diff", "--unified=2"]) : Promise.resolve(null),
   ]);
   return {
-    branch: branch || null,
-    statusShort: statusShort ? truncateText(statusShort, 1600) : "",
+    branch,
+    statusShort: truncateText(statusShort, 1600),
     diffStat: diffStat ? truncateText(diffStat, 1600) : "",
     uncommittedPatch: diffPatch ? truncateText(diffPatch, 2400) : "",
   };
@@ -761,8 +774,10 @@ export function compileContextFromEntries(input: {
     );
   }
 
+  const allTurnDigestLines = turns.map(formatTurnDigestLine);
+
   if (olderTurns.length > 0) {
-    const olderDigest = olderTurns.map(formatTurnDigestLine).join("\n");
+    const olderDigest = allTurnDigestLines.slice(0, splitIdx).join("\n");
     bodySections.push(
       `## Earlier Turns Summary (Turns 1–${olderTurns.length})\n${truncateText(olderDigest, Math.floor(budgetChars * 0.25), markTruncated)}`,
     );
@@ -791,9 +806,10 @@ export function compileContextFromEntries(input: {
       droppedRecent = true;
       break;
     }
-    formattedRecent.unshift(block);
+    formattedRecent.push(block);
     recentChars += block.length + 2;
   }
+  formattedRecent.reverse();
 
   if (formattedRecent.length > 0) {
     bodySections.push(`## Recent Conversation (Verbatim)\n\n${formattedRecent.join("\n\n")}`);
@@ -835,18 +851,20 @@ export function compileContextFromEntries(input: {
     ? ""
     : [headerLines.join("\n"), ...bodySections].join("\n\n");
 
-  const transcriptMarkdown = buildFullTranscriptMarkdown({
-    sourceProvider: input.sourceProvider,
-    sourceModel: input.sourceModel,
-    cwd: input.cwd,
-    turns,
-    git: input.git,
-    filesTouched,
-    latestTodos,
-    latestPlan,
-    handoffNote: cleanNote,
-    ancestor: input.ancestor,
-  });
+  const transcriptMarkdown = isEmptySession
+    ? ""
+    : buildFullTranscriptMarkdown({
+        sourceProvider: input.sourceProvider,
+        sourceModel: input.sourceModel,
+        cwd: input.cwd,
+        turns,
+        git: input.git,
+        filesTouched,
+        latestTodos,
+        latestPlan,
+        handoffNote: cleanNote,
+        ancestor: input.ancestor,
+      });
 
   const previewTurns: PreviewTurn[] = [];
   for (const turn of turns.slice(-3)) {
@@ -872,7 +890,7 @@ export function compileContextFromEntries(input: {
   if (input.ancestor?.ancestorSummary) {
     digestLines.push(truncateText(input.ancestor.ancestorSummary, 1400));
   }
-  digestLines.push(...turns.map(formatTurnDigestLine));
+  digestLines.push(...allTurnDigestLines);
   const ancestorSummary = truncateText(digestLines.join("\n"), 4000);
 
   return {

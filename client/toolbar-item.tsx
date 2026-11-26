@@ -1,5 +1,4 @@
 import {
-  useAgents,
   useComposer,
   usePaseo,
   useRpc,
@@ -9,7 +8,8 @@ import {
   type PluginComposerSelector,
 } from "@getpaseo/plugin/client";
 import { Combobox, type ComboboxItem, useToast } from "@getpaseo/plugin/client/ui";
-import { useCallback, useEffect } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { memo, useCallback, useEffect, useMemo, useRef } from "react";
 import { listCatalogRpc, recordRecentRpc, switchModelRpc } from "../shared/contracts";
 import { DEFAULT_MODEL_SWITCH_SETTINGS, modelSwitchSettings } from "../shared/settings";
 import { executeModelSwitch } from "./switch-runner";
@@ -26,31 +26,31 @@ interface SwitchComboboxItem extends ComboboxItem {
 export function createToolbarComposerItem(
   getComposers: (selector: PluginComposerSelector) => readonly PluginComposer[],
 ) {
-  return function ModelSwitchToolbarItem(_props: PluginComposerItemProps) {
+  const ToolbarCombobox = memo(function ToolbarCombobox() {
     const composer = useComposer();
+    const composerRef = useRef(composer);
+    useEffect(() => {
+      composerRef.current = composer;
+    }, [composer]);
+
     const paseo = usePaseo();
     const toast = useToast();
-    const settingsState = useSettings(modelSwitchSettings);
+    const queryClient = useQueryClient();
     const listCatalog = useRpc(listCatalogRpc);
     const invokeSwitch = useRpc(switchModelRpc);
     const recordRecent = useRpc(recordRecentRpc);
-    const agentRefs = useAgents();
 
-    const triggerStyle =
-      settingsState.status === "ready"
-        ? settingsState.values.composerTriggerStyle
-        : DEFAULT_MODEL_SWITCH_SETTINGS.composerTriggerStyle;
-
-    // Keep imperative pill manager synced with live settings
-    useEffect(() => {
-      if (settingsState.status === "ready") {
-        setTriggerStyle(settingsState.values.composerTriggerStyle);
-      }
-    }, [settingsState]);
+    const currentProvider = composer.agent.provider ?? "";
+    const currentModel = composer.agent.model ?? "";
+    const composerContext = composer.context;
 
     const search = useCallback(
       async ({ query }: { query: string }): Promise<readonly SwitchComboboxItem[]> => {
-        const catalog = await listCatalog({});
+        const catalog = await queryClient.fetchQuery({
+          queryKey: ["model-switch", "catalog", ""],
+          queryFn: () => listCatalog({}),
+          staleTime: 20_000,
+        });
         const needle = query.trim().toLowerCase();
         const items: SwitchComboboxItem[] = [];
 
@@ -64,12 +64,12 @@ export function createToolbarComposerItem(
               model.label.toLowerCase().includes(needle);
             if (!matches) continue;
 
-            const isSame = provider.id === composer.agent.provider;
+            const isSame = provider.id === currentProvider;
             items.push({
               id: `${provider.id}/${model.id}`,
               label: `${provider.label} · ${model.label}`,
               description:
-                composer.context === "agent"
+                composerContext === "agent"
                   ? isSame
                     ? "原地热切"
                     : "跨 Provider 无感续接"
@@ -84,20 +84,21 @@ export function createToolbarComposerItem(
         }
         return items;
       },
-      [listCatalog, composer.agent.provider, composer.context],
+      [queryClient, listCatalog, currentProvider, composerContext],
     );
 
     const handleSelect = useCallback(
       async ({ item }: { item: SwitchComboboxItem }) => {
-        if (composer.context !== "agent") {
+        const currentComposer = composerRef.current;
+        if (currentComposer.context !== "agent") {
           // Draft or new-workspace composer: switch provider + model natively in place!
-          if (composer.agent.provider !== item.providerId) {
-            await composer.setProvider(item.providerId);
+          if (currentComposer.agent.provider !== item.providerId) {
+            await currentComposer.setProvider(item.providerId);
           }
-          await composer.setModel(item.modelId);
+          await currentComposer.setModel(item.modelId);
           if (item.defaultThinkingOptionId) {
             try {
-              await composer.setThinking(item.defaultThinkingOptionId);
+              await currentComposer.setThinking(item.defaultThinkingOptionId);
             } catch {
               // Non-fatal
             }
@@ -106,8 +107,8 @@ export function createToolbarComposerItem(
         }
 
         // Same-provider agent fast path
-        if (composer.agent.provider === item.providerId) {
-          await composer.setModel(item.modelId);
+        if (currentComposer.agent.provider === item.providerId) {
+          await currentComposer.setModel(item.modelId);
           void recordRecent({
             provider: item.providerId,
             model: item.modelId,
@@ -117,33 +118,45 @@ export function createToolbarComposerItem(
           return;
         }
 
-        // Resolve exact agentId matching this composer handle (by identity first, then structural match)
+        // Resolve exact agentId matching this composer handle lazily (capture focused composer first)
+        const focused = getComposers({ focused: true })[0];
+        const { entries } = await paseo.agents.list({ scope: "active" });
+
         let matchedAgentId: string | null = null;
+        let focusedCandidateId: string | null = null;
         const structuralCandidates: string[] = [];
-        for (const ref of agentRefs) {
-          const handle = getComposers({ agentId: ref.id })[0];
+        for (const { agent } of entries) {
+          const handle = getComposers({ agentId: agent.id })[0];
           if (!handle) continue;
-          if (handle === composer) {
-            matchedAgentId = ref.id;
+          if (handle === currentComposer) {
+            matchedAgentId = agent.id;
             break;
           }
+          if (focused && handle === focused) {
+            focusedCandidateId = agent.id;
+          }
           if (
-            handle.context === composer.context &&
-            handle.agent.provider === composer.agent.provider &&
-            handle.agent.model === composer.agent.model &&
-            handle.prompt === composer.prompt
+            handle.context === currentComposer.context &&
+            handle.agent.provider === currentComposer.agent.provider &&
+            handle.agent.model === currentComposer.agent.model &&
+            handle.prompt === currentComposer.prompt
           ) {
-            structuralCandidates.push(ref.id);
+            structuralCandidates.push(agent.id);
           }
         }
         if (!matchedAgentId && structuralCandidates.length === 1) {
           matchedAgentId = structuralCandidates[0];
         }
         if (!matchedAgentId && structuralCandidates.length > 1) {
-          const focused = getComposers({ focused: true })[0];
           matchedAgentId =
+            (focusedCandidateId && structuralCandidates.includes(focusedCandidateId)
+              ? focusedCandidateId
+              : undefined) ??
             structuralCandidates.find((id) => getComposers({ agentId: id })[0] === focused) ??
             structuralCandidates[0];
+        }
+        if (!matchedAgentId && focusedCandidateId) {
+          matchedAgentId = focusedCandidateId;
         }
         if (!matchedAgentId) {
           toast.error("未能定位当前会话，请使用 /m 命令切换。");
@@ -153,7 +166,7 @@ export function createToolbarComposerItem(
         const outcome = await executeModelSwitch(
           {
             agentId: matchedAgentId,
-            currentProvider: composer.agent.provider ?? "",
+            currentProvider: currentComposer.agent.provider ?? "",
             targetProvider: item.providerId,
             targetModel: item.modelId,
             targetModelLabel: item.modelLabel,
@@ -175,28 +188,49 @@ export function createToolbarComposerItem(
           );
         }
       },
-      [composer, agentRefs, paseo, invokeSwitch, recordRecent, toast],
+      [paseo, invokeSwitch, recordRecent, toast],
     );
 
-    if (triggerStyle !== "toolbar") {
-      return null;
-    }
-
-    const currentLabel = composer.agent.model
-      ? composer.agent.model.split("/").pop() || composer.agent.model
-      : composer.agent.provider || "切换模型";
+    const value = useMemo(() => {
+      const currentLabel = currentModel
+        ? currentModel.split("/").pop() || currentModel
+        : currentProvider || "切换模型";
+      return {
+        id: `${currentProvider}/${currentModel}`,
+        label: currentLabel,
+      };
+    }, [currentProvider, currentModel]);
 
     return (
       <Combobox<SwitchComboboxItem>
         title="切换模型 / 跨 Provider 续接"
         icon="ArrowLeftRight"
-        value={{
-          id: `${composer.agent.provider ?? ""}/${composer.agent.model ?? ""}`,
-          label: currentLabel,
-        }}
+        value={value}
         search={search}
         onSelect={handleSelect}
       />
     );
+  });
+
+  return function ModelSwitchToolbarItem(_props: PluginComposerItemProps) {
+    const settingsState = useSettings(modelSwitchSettings);
+
+    const triggerStyle =
+      settingsState.status === "ready"
+        ? settingsState.values.composerTriggerStyle
+        : DEFAULT_MODEL_SWITCH_SETTINGS.composerTriggerStyle;
+
+    // Keep imperative pill manager synced with live settings
+    useEffect(() => {
+      if (settingsState.status === "ready") {
+        setTriggerStyle(triggerStyle);
+      }
+    }, [settingsState.status, triggerStyle]);
+
+    if (triggerStyle !== "toolbar") {
+      return null;
+    }
+
+    return <ToolbarCombobox />;
   };
 }

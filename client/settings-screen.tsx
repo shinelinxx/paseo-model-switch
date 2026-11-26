@@ -34,9 +34,14 @@ export function ModelSwitchSettingsScreen({ theme, layout }: PluginSurfaceProps)
   const charsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const latestRef = useRef<{ values: ModelSwitchSettings; revision: string } | null>(null);
 
-  if (settings.status === "ready") {
-    latestRef.current = { values: settings.values, revision: settings.revision };
-  }
+  const readyValues = settings.status === "ready" ? settings.values : null;
+  const readyRevision = settings.status === "ready" ? settings.revision : null;
+
+  useEffect(() => {
+    if (readyValues && readyRevision !== null) {
+      latestRef.current = { values: readyValues, revision: readyRevision };
+    }
+  }, [readyValues, readyRevision]);
 
   useEffect(() => {
     return () => {

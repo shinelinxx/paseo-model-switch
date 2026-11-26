@@ -10,13 +10,16 @@ export interface CachedTimelineEntry {
 
 interface AgentTimelineCacheRecord {
   epoch: string;
+  startCursor: { epoch: string; seq: number } | null;
   endCursor: { epoch: string; seq: number } | null;
+  hasOlder: boolean;
   entriesBySeq: Map<number, CachedTimelineEntry>;
   updatedAt: number;
 }
 
-const MAX_CACHED_AGENTS = 40;
+const MAX_CACHED_AGENTS = 24;
 const MAX_DELTA_PAGES = 10;
+const MAX_ENTRIES_PER_AGENT = 960;
 
 export class IncrementalTimelineCache {
   private readonly cache = new Map<string, AgentTimelineCacheRecord>();
@@ -74,6 +77,20 @@ export class IncrementalTimelineCache {
     if (oldestKey) this.cache.delete(oldestKey);
   }
 
+  private trimEntriesIfNeeded(record: AgentTimelineCacheRecord): void {
+    if (record.entriesBySeq.size <= MAX_ENTRIES_PER_AGENT) return;
+    const sortedSeqs = Array.from(record.entriesBySeq.keys()).sort((a, b) => a - b);
+    const removeCount = sortedSeqs.length - MAX_ENTRIES_PER_AGENT;
+    for (let i = 0; i < removeCount; i++) {
+      record.entriesBySeq.delete(sortedSeqs[i]);
+    }
+    const newOldestSeq = sortedSeqs[removeCount];
+    if (newOldestSeq !== undefined) {
+      record.startCursor = { epoch: record.epoch, seq: newOldestSeq };
+      record.hasOlder = true;
+    }
+  }
+
   private async catchUpDeltaLocked(
     paseo: PaseoApi,
     agentId: string,
@@ -101,6 +118,9 @@ export class IncrementalTimelineCache {
           seqStart: entry.seqStart,
         });
       }
+      if (!record.startCursor && delta.startCursor) {
+        record.startCursor = delta.startCursor;
+      }
       if (delta.endCursor) {
         record.endCursor = delta.endCursor;
       }
@@ -108,9 +128,11 @@ export class IncrementalTimelineCache {
       pages += 1;
 
       if (!delta.hasNewer || !delta.endCursor || delta.entries.length === 0) {
+        this.trimEntriesIfNeeded(record);
         return true;
       }
       if (delta.endCursor.seq === cursor.seq) {
+        this.trimEntriesIfNeeded(record);
         return true;
       }
       cursor = delta.endCursor;
@@ -135,23 +157,25 @@ export class IncrementalTimelineCache {
       wholeTurns: true,
       projection: "projected",
     });
-    if (!page.hasOlder) {
-      const entriesBySeq = new Map<number, CachedTimelineEntry>();
-      for (const entry of page.entries) {
-        entriesBySeq.set(entry.seqStart, {
-          item: entry.item,
-          timestamp: entry.timestamp,
-          seqStart: entry.seqStart,
-        });
-      }
-      this.cache.set(agentId, {
-        epoch: page.epoch,
-        endCursor: page.endCursor,
-        entriesBySeq,
-        updatedAt: Date.now(),
+    const entriesBySeq = new Map<number, CachedTimelineEntry>();
+    for (const entry of page.entries) {
+      entriesBySeq.set(entry.seqStart, {
+        item: entry.item,
+        timestamp: entry.timestamp,
+        seqStart: entry.seqStart,
       });
-      this.evictIfNeeded();
     }
+    const record: AgentTimelineCacheRecord = {
+      epoch: page.epoch,
+      startCursor: page.startCursor ?? null,
+      endCursor: page.endCursor ?? null,
+      hasOlder: Boolean(page.hasOlder),
+      entriesBySeq,
+      updatedAt: Date.now(),
+    };
+    this.trimEntriesIfNeeded(record);
+    this.cache.set(agentId, record);
+    this.evictIfNeeded();
   }
 
   async syncLatest(paseo: PaseoApi, agentId: string): Promise<void> {
@@ -167,11 +191,56 @@ export class IncrementalTimelineCache {
       const existing = this.cache.get(agentId);
       if (existing?.endCursor) {
         try {
-          const ok = await this.catchUpDeltaLocked(paseo, agentId, existing);
+          let ok = await this.catchUpDeltaLocked(paseo, agentId, existing);
+          if (ok && existing.hasOlder && existing.startCursor) {
+            const handle = paseo.agents.ref(agentId);
+            let backfillPages = 0;
+            while (existing.hasOlder && existing.startCursor && backfillPages < maxPages) {
+              const beforePage = await handle.timeline.refetch({
+                direction: "before",
+                cursor: existing.startCursor,
+                limit: 120,
+                wholeTurns: true,
+                projection: "projected",
+              });
+              if (
+                beforePage.reset ||
+                beforePage.staleCursor ||
+                beforePage.epoch !== existing.epoch
+              ) {
+                this.cache.delete(agentId);
+                ok = false;
+                break;
+              }
+              if (beforePage.entries.length === 0) {
+                existing.hasOlder = false;
+                break;
+              }
+              for (const entry of beforePage.entries) {
+                if (!existing.entriesBySeq.has(entry.seqStart)) {
+                  existing.entriesBySeq.set(entry.seqStart, {
+                    item: entry.item,
+                    timestamp: entry.timestamp,
+                    seqStart: entry.seqStart,
+                  });
+                }
+              }
+              const prevSeq = existing.startCursor.seq;
+              existing.startCursor = beforePage.startCursor ?? existing.startCursor;
+              existing.hasOlder = Boolean(beforePage.hasOlder);
+              existing.updatedAt = Date.now();
+              backfillPages += 1;
+              if (existing.startCursor && existing.startCursor.seq === prevSeq) {
+                break;
+              }
+            }
+          }
           if (ok) {
-            return Array.from(existing.entriesBySeq.values()).sort(
+            const result = Array.from(existing.entriesBySeq.values()).sort(
               (a, b) => a.seqStart - b.seqStart,
             );
+            this.trimEntriesIfNeeded(existing);
+            return result;
           }
         } catch {
           this.cache.delete(agentId);
@@ -188,7 +257,9 @@ export class IncrementalTimelineCache {
       });
 
       const epoch = page.epoch;
-      const endCursor = page.endCursor;
+      const endCursor = page.endCursor ?? null;
+      let startCursor = page.startCursor ?? null;
+      let hasOlder = Boolean(page.hasOlder);
 
       const pushEntries = (entries: typeof page.entries) => {
         for (const entry of entries) {
@@ -205,28 +276,42 @@ export class IncrementalTimelineCache {
       pushEntries(page.entries);
 
       let pageCount = 1;
-      while (page.hasOlder && page.startCursor && pageCount < maxPages) {
+      while (hasOlder && startCursor && pageCount < maxPages) {
         page = await handle.timeline.refetch({
           direction: "before",
-          cursor: page.startCursor,
+          cursor: startCursor,
           limit: 120,
           wholeTurns: true,
           projection: "projected",
         });
-        if (page.entries.length === 0) break;
+        if (page.entries.length === 0) {
+          hasOlder = false;
+          break;
+        }
         pushEntries(page.entries);
+        const prevSeq = startCursor.seq;
+        startCursor = page.startCursor ?? startCursor;
+        hasOlder = Boolean(page.hasOlder);
         pageCount += 1;
+        if (startCursor && startCursor.seq === prevSeq) {
+          break;
+        }
       }
 
-      this.cache.set(agentId, {
+      const result = Array.from(entriesBySeq.values()).sort((a, b) => a.seqStart - b.seqStart);
+      const record: AgentTimelineCacheRecord = {
         epoch,
+        startCursor,
         endCursor,
+        hasOlder,
         entriesBySeq,
         updatedAt: Date.now(),
-      });
+      };
+      this.trimEntriesIfNeeded(record);
+      this.cache.set(agentId, record);
       this.evictIfNeeded();
 
-      return Array.from(entriesBySeq.values()).sort((a, b) => a.seqStart - b.seqStart);
+      return result;
     });
   }
 }

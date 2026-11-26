@@ -11,7 +11,7 @@ import {
 } from "@getpaseo/plugin/client";
 import { Icon, ScrollView, TextInput, useToast } from "@getpaseo/plugin/client/ui";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ActivityIndicator, Pressable, Text, View } from "react-native";
 import {
   listCatalogRpc,
@@ -38,13 +38,155 @@ export interface ModelSwitcherBodyProps {
   onDone?: () => void;
 }
 
+const EMPTY_PROVIDERS: readonly CatalogProvider[] = [];
+const EMPTY_REFS: readonly ModelRef[] = [];
+
 function shortModelName(model: string | null | undefined): string {
   if (!model) return "default";
   const parts = model.split("/");
   return parts[parts.length - 1] || model;
 }
 
-export function ModelSwitcherBody({
+interface ModelRowStyles {
+  modelRowWrap: object;
+  modelRow: object;
+  modelRowActive: object;
+  modelName: object;
+  modelSub: object;
+  iconBtn: object;
+  modeBadge: object;
+  thinkingRow: object;
+  thinkingChip: object;
+  thinkingChipActive: object;
+  thinkingChipText: object;
+}
+
+interface ModelRowProps {
+  provider: CatalogProvider;
+  model: CatalogModel;
+  rowKey: string;
+  showProviderTag: boolean;
+  isSameProvider: boolean;
+  isCurrent: boolean;
+  disabled: boolean;
+  isPinned: boolean;
+  thinkingExpanded: boolean;
+  isTopSearchMatch: boolean;
+  currentThinkingOptionId: string | null | undefined;
+  theme: PluginTheme;
+  styles: ModelRowStyles;
+  onSelect: (provider: CatalogProvider, model: CatalogModel, thinkingOptionId?: string) => void;
+  onTogglePin: (provider: CatalogProvider, model: CatalogModel) => void;
+  onToggleThinking: (rowKey: string) => void;
+}
+
+const ModelRow = memo(function ModelRow({
+  provider,
+  model,
+  rowKey,
+  showProviderTag,
+  isSameProvider,
+  isCurrent,
+  disabled,
+  isPinned,
+  thinkingExpanded,
+  isTopSearchMatch,
+  currentThinkingOptionId,
+  theme,
+  styles,
+  onSelect,
+  onTogglePin,
+  onToggleThinking,
+}: ModelRowProps) {
+  const hasThinking = (model.thinkingOptions?.length ?? 0) > 1;
+
+  return (
+    <View style={styles.modelRowWrap}>
+      <View style={[styles.modelRow, isCurrent ? styles.modelRowActive : null]}>
+        <Pressable
+          accessibilityRole="button"
+          disabled={disabled}
+          onPress={() => onSelect(provider, model)}
+          style={({ pressed }) => [
+            { flex: 1, gap: 2, opacity: disabled && !isCurrent ? 0.45 : pressed ? 0.7 : 1 },
+          ]}
+        >
+          <Text numberOfLines={1} style={styles.modelName}>
+            {model.label}
+          </Text>
+          <Text numberOfLines={1} style={styles.modelSub}>
+            {showProviderTag ? `${provider.label} · ${model.id}` : model.id}
+          </Text>
+        </Pressable>
+
+        {hasThinking ? (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="选择思考档位"
+            disabled={disabled}
+            onPress={() => onToggleThinking(rowKey)}
+            style={styles.iconBtn}
+          >
+            <Icon
+              name="Sparkles"
+              size={13}
+              color={thinkingExpanded ? theme.colors.accent : theme.colors.foregroundMuted}
+            />
+          </Pressable>
+        ) : null}
+
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={isPinned ? "取消置顶" : "置顶模型"}
+          onPress={() => onTogglePin(provider, model)}
+          style={styles.iconBtn}
+        >
+          <Icon
+            name="Star"
+            size={13}
+            color={isPinned ? theme.colors.statusWarning : theme.colors.foregroundMuted}
+          />
+        </Pressable>
+
+        {isCurrent ? (
+          <Icon name="Check" size={14} color={theme.colors.statusSuccess} />
+        ) : isTopSearchMatch ? (
+          <Text style={[styles.modeBadge, { color: theme.colors.accent }]}>↵</Text>
+        ) : (
+          <Icon
+            name={isSameProvider ? "Zap" : "ArrowRight"}
+            size={13}
+            color={theme.colors.foregroundMuted}
+          />
+        )}
+      </View>
+
+      {hasThinking && thinkingExpanded ? (
+        <View style={styles.thinkingRow}>
+          {model.thinkingOptions!.map((opt) => {
+            const activeOpt = isCurrent && currentThinkingOptionId === opt.id;
+            return (
+              <Pressable
+                key={opt.id}
+                accessibilityRole="button"
+                disabled={disabled}
+                onPress={() => onSelect(provider, model, opt.id)}
+                style={[styles.thinkingChip, activeOpt ? styles.thinkingChipActive : null]}
+              >
+                <Text style={styles.thinkingChipText}>
+                  {opt.label}
+                  {opt.isDefault ? " · 默认" : ""}
+                </Text>
+              </Pressable>
+            );
+          })}
+        </View>
+      ) : null}
+    </View>
+  );
+});
+
+export const ModelSwitcherBody = memo(function ModelSwitcherBody({
   agentId,
   theme,
   compact,
@@ -99,16 +241,41 @@ export function ModelSwitcherBody({
 
   const archivePrevious = archiveOverride ?? defaultArchive;
 
-  const catalogQueryKey = ["model-switch", "catalog", agentInfo?.cwd ?? ""] as const;
+  const handoffNoteRef = useRef(handoffNote);
+  const archivePreviousRef = useRef(archivePrevious);
+  const forceStopRunningRef = useRef(forceStopRunning);
+  useEffect(() => {
+    handoffNoteRef.current = handoffNote;
+    archivePreviousRef.current = archivePrevious;
+    forceStopRunningRef.current = forceStopRunning;
+  }, [handoffNote, archivePrevious, forceStopRunning]);
+
+  const catalogQueryKey = useMemo(
+    () => ["model-switch", "catalog", agentInfo?.cwd ?? ""] as const,
+    [agentInfo?.cwd],
+  );
   const catalogQuery = useQuery({
     queryKey: catalogQueryKey,
     queryFn: () => listCatalog({ cwd: agentInfo?.cwd }),
     staleTime: 20_000,
   });
 
-  const allProviders = catalogQuery.data?.providers ?? [];
-  const pinnedList = catalogQuery.data?.pinned ?? [];
-  const recentList = catalogQuery.data?.recent ?? [];
+  const allProviders = catalogQuery.data?.providers ?? EMPTY_PROVIDERS;
+  const pinnedList = catalogQuery.data?.pinned ?? EMPTY_REFS;
+  const recentList = catalogQuery.data?.recent ?? EMPTY_REFS;
+
+  const indexedProviders = useMemo(
+    () =>
+      allProviders.map((provider) => ({
+        provider,
+        providerSearchKey: `${provider.id}\0${provider.label}`.toLowerCase(),
+        models: provider.models.map((model) => ({
+          model,
+          searchKey: `${model.id}\0${model.label}\0${model.description ?? ""}`.toLowerCase(),
+        })),
+      })),
+    [allProviders],
+  );
 
   const pinnedSet = useMemo(() => {
     const s = new Set<string>();
@@ -180,30 +347,29 @@ export function ModelSwitcherBody({
   const filteredProviders = useMemo(() => {
     const scoped =
       providerFilter === "all"
-        ? allProviders
-        : allProviders.filter((p) => p.id === providerFilter);
+        ? indexedProviders
+        : indexedProviders.filter((entry) => entry.provider.id === providerFilter);
     const needle = query.trim().toLowerCase();
-    if (!needle) return scoped;
+    if (!needle) return scoped.map((entry) => entry.provider);
 
     const result: CatalogProvider[] = [];
-    for (const provider of scoped) {
-      const providerMatches =
-        provider.id.toLowerCase().includes(needle) ||
-        provider.label.toLowerCase().includes(needle);
-      const matchingModels = providerMatches
-        ? provider.models
-        : provider.models.filter(
-            (m) =>
-              m.id.toLowerCase().includes(needle) ||
-              m.label.toLowerCase().includes(needle) ||
-              (m.description?.toLowerCase().includes(needle) ?? false),
-          );
+    for (const entry of scoped) {
+      if (entry.providerSearchKey.includes(needle)) {
+        result.push(entry.provider);
+        continue;
+      }
+      const matchingModels: CatalogModel[] = [];
+      for (const m of entry.models) {
+        if (m.searchKey.includes(needle)) {
+          matchingModels.push(m.model);
+        }
+      }
       if (matchingModels.length > 0) {
-        result.push({ ...provider, models: matchingModels });
+        result.push({ ...entry.provider, models: matchingModels });
       }
     }
     return result;
-  }, [allProviders, providerFilter, query]);
+  }, [indexedProviders, providerFilter, query]);
 
   const topSearchMatch = useMemo(() => {
     if (!query.trim()) return null;
@@ -452,98 +618,126 @@ export function ModelSwitcherBody({
     [theme, compact, isPopover],
   );
 
-  const handleTogglePin = async (provider: CatalogProvider, model: CatalogModel) => {
-    try {
-      const res = await togglePin({
+  const handleTogglePin = useCallback(
+    (provider: CatalogProvider, model: CatalogModel) => {
+      void togglePin({
         provider: provider.id,
         model: model.id,
         label: model.label,
-      });
-      queryClient.setQueryData(catalogQueryKey, (old: typeof catalogQuery.data) => {
-        if (!old) return old;
-        return { ...old, pinned: res.items };
-      });
-    } catch {
-      toast.error("更新收藏状态失败");
-    }
-  };
+      })
+        .then((res) => {
+          queryClient.setQueryData(catalogQueryKey, (old: typeof catalogQuery.data) => {
+            if (!old) return old;
+            return { ...old, pinned: res.items };
+          });
+        })
+        .catch(() => {
+          toast.error("更新收藏状态失败");
+        });
+    },
+    [togglePin, queryClient, catalogQueryKey, toast],
+  );
 
-  const handleSelectModel = async (
-    provider: CatalogProvider,
-    model: CatalogModel,
-    thinkingOptionId?: string,
-  ) => {
-    if (!agentInfo || switchingTarget) return;
-    const isSameProvider = provider.id === agentInfo.provider;
-    const chosenThinking = thinkingOptionId ?? model.defaultThinkingOptionId;
-    const isCurrentSameModel =
-      isSameProvider &&
-      (model.id === agentInfo.model || (!agentInfo.model && Boolean(model.isDefault)));
-    const isSameThinking =
-      !thinkingOptionId || thinkingOptionId === agentInfo.thinkingOptionId;
+  const handleToggleThinking = useCallback((rowKey: string) => {
+    setExpandedThinkingKey((prev) => (prev === rowKey ? null : rowKey));
+  }, []);
 
-    if (isCurrentSameModel && isSameThinking) {
-      onDone?.();
-      return;
-    }
+  const handleSelectModel = useCallback(
+    async (provider: CatalogProvider, model: CatalogModel, thinkingOptionId?: string) => {
+      if (!agentInfo || switchingTarget) return;
+      const isSameProvider = provider.id === agentInfo.provider;
+      const chosenThinking = thinkingOptionId ?? model.defaultThinkingOptionId;
+      const isCurrentSameModel =
+        isSameProvider &&
+        (model.id === agentInfo.model || (!agentInfo.model && Boolean(model.isDefault)));
+      const isSameThinking =
+        !thinkingOptionId || thinkingOptionId === agentInfo.thinkingOptionId;
 
-    if (!isSameProvider && agentInfo.status === "running" && !forceStopRunning) {
-      setErrorText("当前会话运行中：可勾选上方「停止并切换」立即中断，或等待本轮结束。");
-      return;
-    }
-
-    const targetKey = `${provider.id}/${model.id}`;
-    setSwitchingTarget(targetKey);
-    setErrorText(null);
-
-    try {
-      const outcome = await executeModelSwitch(
-        {
-          agentId,
-          currentProvider: agentInfo.provider,
-          targetProvider: provider.id,
-          targetModel: model.id,
-          targetModelLabel: model.label,
-          targetThinkingOptionId: chosenThinking,
-          handoffNote: handoffNote.trim() || undefined,
-          stopRunning: !isSameProvider && agentInfo.status === "running" && forceStopRunning,
-          archivePreviousOverride: archivePrevious,
-        },
-        {
-          paseo,
-          getComposers,
-          invokeSwitch,
-          recordRecent,
-          openAgent,
-          // Close popover BEFORE focusing new composer so unmount doesn't steal focus
-          onBeforeFocus: onDone,
-        },
-      );
-
-      void queryClient.invalidateQueries({ queryKey: catalogQueryKey });
-
-      if (outcome.kind === "in-place") {
-        const noteTag = outcome.notePrefilled ? "（已将备注填入输入框）" : "";
-        toast.show(
-          `已原地切换至 ${model.label}${thinkingOptionId ? ` (${thinkingOptionId})` : ""}${noteTag}`,
-          { variant: "success" },
-        );
-      } else {
-        const turnTag = outcome.totalTurns > 0 ? `（继承 ${outcome.totalTurns} 轮上下文）` : "";
-        const skipTag = outcome.archiveSkippedReason ? ` · ${outcome.archiveSkippedReason}` : "";
-        toast.show(
-          `已切换至 ${provider.label} / ${model.label}${turnTag}${skipTag}`,
-          { variant: "success" },
-        );
+      if (isCurrentSameModel && isSameThinking) {
+        onDone?.();
+        return;
       }
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      setErrorText(msg);
-      toast.error(`切换失败：${msg}`);
-    } finally {
-      setSwitchingTarget(null);
-    }
-  };
+
+      const forceStop = forceStopRunningRef.current;
+      if (!isSameProvider && agentInfo.status === "running" && !forceStop) {
+        setErrorText("当前会话运行中：可勾选上方「停止并切换」立即中断，或等待本轮结束。");
+        return;
+      }
+
+      const targetKey = `${provider.id}/${model.id}`;
+      setSwitchingTarget(targetKey);
+      setErrorText(null);
+
+      try {
+        const outcome = await executeModelSwitch(
+          {
+            agentId,
+            currentProvider: agentInfo.provider,
+            targetProvider: provider.id,
+            targetModel: model.id,
+            targetModelLabel: model.label,
+            targetThinkingOptionId: chosenThinking,
+            handoffNote: handoffNoteRef.current.trim() || undefined,
+            stopRunning: !isSameProvider && agentInfo.status === "running" && forceStop,
+            archivePreviousOverride: archivePreviousRef.current,
+          },
+          {
+            paseo,
+            getComposers,
+            invokeSwitch,
+            recordRecent,
+            openAgent,
+            // Close popover BEFORE focusing new composer so unmount doesn't steal focus
+            onBeforeFocus: onDone,
+          },
+        );
+
+        void queryClient.invalidateQueries({ queryKey: catalogQueryKey });
+
+        if (outcome.kind === "in-place") {
+          const noteTag = outcome.notePrefilled ? "（已将备注填入输入框）" : "";
+          toast.show(
+            `已原地切换至 ${model.label}${thinkingOptionId ? ` (${thinkingOptionId})` : ""}${noteTag}`,
+            { variant: "success" },
+          );
+        } else {
+          const turnTag = outcome.totalTurns > 0 ? `（继承 ${outcome.totalTurns} 轮上下文）` : "";
+          const skipTag = outcome.archiveSkippedReason ? ` · ${outcome.archiveSkippedReason}` : "";
+          toast.show(
+            `已切换至 ${provider.label} / ${model.label}${turnTag}${skipTag}`,
+            { variant: "success" },
+          );
+        }
+      } catch (error) {
+        const msg = error instanceof Error ? error.message : String(error);
+        setErrorText(msg);
+        toast.error(`切换失败：${msg}`);
+      } finally {
+        setSwitchingTarget(null);
+      }
+    },
+    [
+      agentId,
+      agentInfo,
+      switchingTarget,
+      onDone,
+      paseo,
+      getComposers,
+      invokeSwitch,
+      recordRecent,
+      openAgent,
+      queryClient,
+      catalogQueryKey,
+      toast,
+    ],
+  );
+
+  const onSelectModelRow = useCallback(
+    (provider: CatalogProvider, model: CatalogModel, thinkingOptionId?: string) => {
+      void handleSelectModel(provider, model, thinkingOptionId);
+    },
+    [handleSelectModel],
+  );
 
   const renderModelRow = (
     provider: CatalogProvider,
@@ -561,94 +755,33 @@ export function ModelSwitcherBody({
     const fullKey = `${provider.id}/${model.id}`;
     const rowKey = `${keyPrefix}:${fullKey}`;
     const isPinned = pinnedSet.has(fullKey);
-    const hasThinking = (model.thinkingOptions?.length ?? 0) > 1;
     const thinkingExpanded = expandedThinkingKey === rowKey;
+    const isTopSearchMatch = Boolean(
+      topSearchMatch &&
+        topSearchMatch.provider.id === provider.id &&
+        topSearchMatch.model.id === model.id,
+    );
 
     return (
-      <View key={rowKey} style={styles.modelRowWrap}>
-        <View style={[styles.modelRow, isCurrent ? styles.modelRowActive : null]}>
-          <Pressable
-            accessibilityRole="button"
-            disabled={disabled}
-            onPress={() => void handleSelectModel(provider, model)}
-            style={({ pressed }) => [
-              { flex: 1, gap: 2, opacity: disabled && !isCurrent ? 0.45 : pressed ? 0.7 : 1 },
-            ]}
-          >
-            <Text numberOfLines={1} style={styles.modelName}>
-              {model.label}
-            </Text>
-            <Text numberOfLines={1} style={styles.modelSub}>
-              {showProviderTag ? `${provider.label} · ${model.id}` : model.id}
-            </Text>
-          </Pressable>
-
-          {hasThinking ? (
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="选择思考档位"
-              disabled={disabled}
-              onPress={() => setExpandedThinkingKey(thinkingExpanded ? null : rowKey)}
-              style={styles.iconBtn}
-            >
-              <Icon
-                name="Sparkles"
-                size={13}
-                color={thinkingExpanded ? theme.colors.accent : theme.colors.foregroundMuted}
-              />
-            </Pressable>
-          ) : null}
-
-          <Pressable
-            accessibilityRole="button"
-            accessibilityLabel={isPinned ? "取消置顶" : "置顶模型"}
-            onPress={() => void handleTogglePin(provider, model)}
-            style={styles.iconBtn}
-          >
-            <Icon
-              name="Star"
-              size={13}
-              color={isPinned ? theme.colors.statusWarning : theme.colors.foregroundMuted}
-            />
-          </Pressable>
-
-          {isCurrent ? (
-            <Icon name="Check" size={14} color={theme.colors.statusSuccess} />
-          ) : topSearchMatch &&
-            topSearchMatch.provider.id === provider.id &&
-            topSearchMatch.model.id === model.id ? (
-            <Text style={[styles.modeBadge, { color: theme.colors.accent }]}>↵</Text>
-          ) : (
-            <Icon
-              name={isSameProvider ? "Zap" : "ArrowRight"}
-              size={13}
-              color={theme.colors.foregroundMuted}
-            />
-          )}
-        </View>
-
-        {hasThinking && thinkingExpanded ? (
-          <View style={styles.thinkingRow}>
-            {model.thinkingOptions!.map((opt) => {
-              const activeOpt = isCurrent && agentInfo?.thinkingOptionId === opt.id;
-              return (
-                <Pressable
-                  key={opt.id}
-                  accessibilityRole="button"
-                  disabled={disabled}
-                  onPress={() => void handleSelectModel(provider, model, opt.id)}
-                  style={[styles.thinkingChip, activeOpt ? styles.thinkingChipActive : null]}
-                >
-                  <Text style={styles.thinkingChipText}>
-                    {opt.label}
-                    {opt.isDefault ? " · 默认" : ""}
-                  </Text>
-                </Pressable>
-              );
-            })}
-          </View>
-        ) : null}
-      </View>
+      <ModelRow
+        key={rowKey}
+        provider={provider}
+        model={model}
+        rowKey={rowKey}
+        showProviderTag={showProviderTag}
+        isSameProvider={isSameProvider}
+        isCurrent={isCurrent}
+        disabled={disabled}
+        isPinned={isPinned}
+        thinkingExpanded={thinkingExpanded}
+        isTopSearchMatch={isTopSearchMatch}
+        currentThinkingOptionId={agentInfo?.thinkingOptionId}
+        theme={theme}
+        styles={styles}
+        onSelect={onSelectModelRow}
+        onTogglePin={handleTogglePin}
+        onToggleThinking={handleToggleThinking}
+      />
     );
   };
 
@@ -880,7 +1013,7 @@ export function ModelSwitcherBody({
       </View>
     </View>
   );
-}
+});
 
 export function createPopoverComponent(
   getComposers: (selector: PluginComposerSelector) => readonly PluginComposer[],

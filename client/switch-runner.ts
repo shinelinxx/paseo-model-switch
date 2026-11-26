@@ -62,10 +62,14 @@ async function waitForComposer(
   timeoutMs = 3500,
 ): Promise<PluginComposer | null> {
   const deadline = Date.now() + timeoutMs;
+  let delayMs = 25;
   while (Date.now() < deadline) {
     const found = getComposers({ agentId })[0];
     if (found) return found;
-    await sleep(100);
+    await sleep(delayMs);
+    if (delayMs < 100) {
+      delayMs = Math.min(100, delayMs * 2);
+    }
   }
   return getComposers({ agentId })[0] ?? null;
 }
@@ -334,7 +338,7 @@ function parseSlashTokens(raw: string): ParsedSlashArgs {
   return { spec, followUpPrompt, stopRunning, handoffNote };
 }
 
-function scoreFuzzyMatch(needleLower: string, model: CatalogModel): number {
+function scoreFuzzyMatch(needleLower: string, boundaryRe: RegExp, model: CatalogModel): number {
   const idLower = model.id.toLowerCase();
   const labelLower = model.label.toLowerCase();
   const tailLower = idLower.split("/").pop() ?? idLower;
@@ -343,7 +347,6 @@ function scoreFuzzyMatch(needleLower: string, model: CatalogModel): number {
   if (tailLower.startsWith(needleLower) || idLower.startsWith(needleLower)) return 80;
   if (labelLower.startsWith(needleLower)) return 75;
   // Word/delimiter boundary match (e.g. `-sol`, `/deepseek`)
-  const boundaryRe = new RegExp(`(?:^|[/\\-_\\s])${needleLower.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`);
   if (boundaryRe.test(idLower) || boundaryRe.test(labelLower)) return 60;
   if (idLower.includes(needleLower) || labelLower.includes(needleLower)) return 40;
   return 0;
@@ -353,8 +356,11 @@ function pickBestModelMatch(
   needleLower: string,
   candidates: Array<{ provider: CatalogProvider; model: CatalogModel }>,
 ): { match?: { provider: CatalogProvider; model: CatalogModel }; ambiguous?: Array<{ provider: CatalogProvider; model: CatalogModel }> } {
+  const boundaryRe = new RegExp(
+    `(?:^|[/\\-_\\s])${needleLower.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`,
+  );
   const scored = candidates
-    .map((c) => ({ ...c, score: scoreFuzzyMatch(needleLower, c.model) }))
+    .map((c) => ({ ...c, score: scoreFuzzyMatch(needleLower, boundaryRe, c.model) }))
     .filter((c) => c.score > 0);
 
   if (scored.length === 0) return {};

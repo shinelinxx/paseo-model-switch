@@ -41,9 +41,88 @@ const VALID_SWITCH_ID = /^[a-zA-Z0-9_-]{4,64}$/;
 const MAX_RECENT_MODELS = 8;
 const MAX_PINNED_MODELS = 16;
 const DEFAULT_MAX_RETAINED_RECORDS = 200;
+const AUTO_PRUNE_HYSTERESIS = 20;
+const MAX_RECORD_CACHE = 32;
+const MAX_PREF_CACHE_ROOTS = 8;
+const PRUNE_READ_CONCURRENCY = 16;
 
 // In-process serial write queue per data root to eliminate preferences read-modify-write races
 const preferenceWriteQueues = new Map<string, Promise<unknown>>();
+// Bounded LRU cache for immutable PersistedSwitchRecord entries keyed by resolved record file path
+const recordCache = new Map<string, PersistedSwitchRecord>();
+// Bounded write-through cache for UserModelPreferences keyed by getDataRoot(root)
+const preferencesCache = new Map<string, { prefs: UserModelPreferences; mtimeMs: number | null }>();
+// Cache of initialized directory paths to avoid redundant fs.mkdir syscalls
+const initializedDirs = new Set<string>();
+// Per-root in-flight guard for pruneOldSwitchArtifacts
+const pruningRoots = new Set<string>();
+// Estimated record count per root to avoid unnecessary auto-prune readdir scans under hysteresis
+const estimatedRecordCounts = new Map<string, number>();
+
+function getCachedRecord(recordPath: string): PersistedSwitchRecord | undefined {
+  const key = path.resolve(recordPath);
+  const hit = recordCache.get(key);
+  if (!hit) return undefined;
+  recordCache.delete(key);
+  recordCache.set(key, hit);
+  return hit;
+}
+
+function setCachedRecord(recordPath: string, record: PersistedSwitchRecord): void {
+  const key = path.resolve(recordPath);
+  if (recordCache.has(key)) {
+    recordCache.delete(key);
+  }
+  recordCache.set(key, record);
+  if (recordCache.size > MAX_RECORD_CACHE) {
+    const oldestKey = recordCache.keys().next().value;
+    if (oldestKey !== undefined) recordCache.delete(oldestKey);
+  }
+}
+
+function deleteCachedRecord(recordPath: string): void {
+  recordCache.delete(path.resolve(recordPath));
+}
+
+function setCachedPreferences(
+  rootKey: string,
+  entry: { prefs: UserModelPreferences; mtimeMs: number | null },
+): void {
+  if (preferencesCache.has(rootKey)) {
+    preferencesCache.delete(rootKey);
+  }
+  preferencesCache.set(rootKey, entry);
+  if (preferencesCache.size > MAX_PREF_CACHE_ROOTS) {
+    const oldestKey = preferencesCache.keys().next().value;
+    if (oldestKey !== undefined) preferencesCache.delete(oldestKey);
+  }
+}
+
+async function ensureDir(dirPath: string): Promise<void> {
+  const resolved = path.resolve(dirPath);
+  if (initializedDirs.has(resolved)) return;
+  await fs.mkdir(resolved, { recursive: true });
+  initializedDirs.add(resolved);
+}
+
+async function runWithConcurrency<T>(
+  items: readonly T[],
+  concurrency: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  if (items.length === 0) return;
+  let index = 0;
+  const workerCount = Math.min(concurrency, items.length);
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (index < items.length) {
+        const current = items[index];
+        index += 1;
+        await worker(current);
+      }
+    }),
+  );
+}
 
 function enqueuePrefWrite<T>(rootKey: string, task: () => Promise<T>): Promise<T> {
   const prev = preferenceWriteQueues.get(rootKey) ?? Promise.resolve();
@@ -59,8 +138,13 @@ function enqueuePrefWrite<T>(rootKey: string, task: () => Promise<T>): Promise<T
 
 async function writeFileAtomic(filePath: string, content: string): Promise<void> {
   const tmpPath = `${filePath}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
-  await fs.writeFile(tmpPath, content, "utf8");
-  await fs.rename(tmpPath, filePath);
+  try {
+    await fs.writeFile(tmpPath, content, "utf8");
+    await fs.rename(tmpPath, filePath);
+  } catch (error) {
+    initializedDirs.delete(path.resolve(path.dirname(filePath)));
+    throw error;
+  }
 }
 
 export function getDataRoot(overrideRoot?: string): string {
@@ -101,12 +185,11 @@ export async function saveSwitchArtifacts(
   root?: string,
 ): Promise<PersistedSwitchRecord> {
   assertValidSwitchId(input.record.switchId);
-  await Promise.all([
-    fs.mkdir(recordsDir(root), { recursive: true }),
-    fs.mkdir(transcriptsDir(root), { recursive: true }),
-  ]);
+  const rDir = recordsDir(root);
+  const tDir = transcriptsDir(root);
+  await Promise.all([ensureDir(rDir), ensureDir(tDir)]);
 
-  const transcriptPath = path.join(transcriptsDir(root), `${input.record.switchId}.md`);
+  const transcriptPath = path.join(tDir, `${input.record.switchId}.md`);
   const currentHop: StoredHopEntry = {
     switchId: input.record.switchId,
     hop: input.record.hopCount,
@@ -136,22 +219,59 @@ export async function saveSwitchArtifacts(
       : undefined,
   };
 
-  const recordPath = path.join(recordsDir(root), `${input.record.switchId}.json`);
+  const recordPath = path.join(rDir, `${input.record.switchId}.json`);
   await Promise.all([
     writeFileAtomic(transcriptPath, input.transcriptMarkdown),
     writeFileAtomic(recordPath, JSON.stringify(fullRecord, null, 2)),
   ]);
 
-  // Fire-and-forget lightweight GC so disk usage stays bounded
-  void pruneOldSwitchArtifacts(DEFAULT_MAX_RETAINED_RECORDS, root).catch(() => undefined);
+  setCachedRecord(recordPath, fullRecord);
+
+  // Fire-and-forget lightweight GC with hysteresis so disk usage stays bounded without per-save churn
+  const rootKey = getDataRoot(root);
+  const prevEstimate = estimatedRecordCounts.get(rootKey);
+  if (prevEstimate !== undefined) {
+    const nextEstimate = prevEstimate + 1;
+    estimatedRecordCounts.set(rootKey, nextEstimate);
+    if (nextEstimate > DEFAULT_MAX_RETAINED_RECORDS + AUTO_PRUNE_HYSTERESIS) {
+      void pruneOldSwitchArtifactsInternal(
+        DEFAULT_MAX_RETAINED_RECORDS,
+        root,
+        AUTO_PRUNE_HYSTERESIS,
+      ).catch(() => undefined);
+    }
+  } else {
+    void pruneOldSwitchArtifactsInternal(
+      DEFAULT_MAX_RETAINED_RECORDS,
+      root,
+      AUTO_PRUNE_HYSTERESIS,
+    ).catch(() => undefined);
+  }
 
   return fullRecord;
 }
 
-export async function pruneOldSwitchArtifacts(
-  maxRetained = DEFAULT_MAX_RETAINED_RECORDS,
-  root?: string,
+function collectProtectedTranscripts(
+  rec: Partial<PersistedSwitchRecord>,
+  protectedTranscripts: Set<string>,
+): void {
+  if (rec.transcriptPath) protectedTranscripts.add(path.resolve(rec.transcriptPath));
+  if (Array.isArray(rec.priorTranscriptPaths)) {
+    for (const p of rec.priorTranscriptPaths) protectedTranscripts.add(path.resolve(p));
+  }
+  if (Array.isArray(rec.hops)) {
+    for (const h of rec.hops) {
+      if (h.transcriptPath) protectedTranscripts.add(path.resolve(h.transcriptPath));
+    }
+  }
+}
+
+async function pruneOldSwitchArtifactsInternal(
+  maxRetained: number,
+  root: string | undefined,
+  hysteresis: number,
 ): Promise<{ deletedRecords: number; deletedTranscripts: number }> {
+  const rootKey = getDataRoot(root);
   const rDir = recordsDir(root);
   const tDir = transcriptsDir(root);
   let recordFiles: string[];
@@ -161,75 +281,96 @@ export async function pruneOldSwitchArtifacts(
     return { deletedRecords: 0, deletedTranscripts: 0 };
   }
 
-  if (recordFiles.length <= maxRetained) {
+  estimatedRecordCounts.set(rootKey, recordFiles.length);
+
+  if (recordFiles.length <= maxRetained + hysteresis) {
     return { deletedRecords: 0, deletedTranscripts: 0 };
   }
 
-  const withMtime = await Promise.all(
-    recordFiles.map(async (file) => {
+  if (pruningRoots.has(rootKey)) {
+    return { deletedRecords: 0, deletedTranscripts: 0 };
+  }
+
+  pruningRoots.add(rootKey);
+  try {
+    const withMtime: Array<{ file: string; fullPath: string; mtimeMs: number }> = [];
+    await runWithConcurrency(recordFiles, PRUNE_READ_CONCURRENCY, async (file) => {
       const fullPath = path.join(rDir, file);
       try {
         const st = await fs.stat(fullPath);
-        return { file, fullPath, mtimeMs: st.mtimeMs };
+        withMtime.push({ file, fullPath, mtimeMs: st.mtimeMs });
       } catch {
-        return { file, fullPath, mtimeMs: 0 };
+        withMtime.push({ file, fullPath, mtimeMs: 0 });
       }
-    }),
-  );
+    });
 
-  withMtime.sort((a, b) => b.mtimeMs - a.mtimeMs);
-  const keep = withMtime.slice(0, maxRetained);
-  const drop = withMtime.slice(maxRetained);
+    withMtime.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    const keep = withMtime.slice(0, maxRetained);
+    const drop = withMtime.slice(maxRetained);
 
-  // Protect all transcripts referenced by kept records (including multi-hop ancestors)
-  const protectedTranscripts = new Set<string>();
-  for (const entry of keep) {
-    try {
-      const raw = await fs.readFile(entry.fullPath, "utf8");
-      const rec = JSON.parse(raw) as Partial<PersistedSwitchRecord>;
-      if (rec.transcriptPath) protectedTranscripts.add(path.resolve(rec.transcriptPath));
-      if (Array.isArray(rec.priorTranscriptPaths)) {
-        for (const p of rec.priorTranscriptPaths) protectedTranscripts.add(path.resolve(p));
+    // Protect all transcripts referenced by kept records (including multi-hop ancestors)
+    const protectedTranscripts = new Set<string>();
+    const uncachedKeep: Array<{ file: string; fullPath: string; mtimeMs: number }> = [];
+    for (const entry of keep) {
+      const cached = getCachedRecord(entry.fullPath);
+      if (cached) {
+        collectProtectedTranscripts(cached, protectedTranscripts);
+      } else {
+        uncachedKeep.push(entry);
       }
-      if (Array.isArray(rec.hops)) {
-        for (const h of rec.hops) {
-          if (h.transcriptPath) protectedTranscripts.add(path.resolve(h.transcriptPath));
-        }
-      }
-    } catch {
-      // Ignore corrupt record
     }
-  }
 
-  let deletedRecords = 0;
-  for (const entry of drop) {
+    await runWithConcurrency(uncachedKeep, PRUNE_READ_CONCURRENCY, async (entry) => {
+      try {
+        const raw = await fs.readFile(entry.fullPath, "utf8");
+        const rec = JSON.parse(raw) as Partial<PersistedSwitchRecord>;
+        collectProtectedTranscripts(rec, protectedTranscripts);
+      } catch {
+        // Ignore corrupt record
+      }
+    });
+
+    let deletedRecords = 0;
+    await runWithConcurrency(drop, PRUNE_READ_CONCURRENCY, async (entry) => {
+      deleteCachedRecord(entry.fullPath);
+      try {
+        await fs.unlink(entry.fullPath);
+        deletedRecords += 1;
+      } catch {
+        // Ignore already-removed file
+      }
+    });
+
+    let deletedTranscripts = 0;
     try {
-      await fs.unlink(entry.fullPath);
-      deletedRecords += 1;
-    } catch {
-      // Ignore already-removed file
-    }
-  }
-
-  let deletedTranscripts = 0;
-  try {
-    const transcriptFiles = (await fs.readdir(tDir)).filter((f) => f.endsWith(".md"));
-    for (const file of transcriptFiles) {
-      const fullPath = path.resolve(path.join(tDir, file));
-      if (!protectedTranscripts.has(fullPath)) {
+      const transcriptFiles = (await fs.readdir(tDir)).filter((f) => f.endsWith(".md"));
+      const toDelete = transcriptFiles
+        .map((file) => path.resolve(path.join(tDir, file)))
+        .filter((fullPath) => !protectedTranscripts.has(fullPath));
+      await runWithConcurrency(toDelete, PRUNE_READ_CONCURRENCY, async (fullPath) => {
         try {
           await fs.unlink(fullPath);
           deletedTranscripts += 1;
         } catch {
           // Ignore
         }
-      }
+      });
+    } catch {
+      // Ignore missing dir
     }
-  } catch {
-    // Ignore missing dir
-  }
 
-  return { deletedRecords, deletedTranscripts };
+    estimatedRecordCounts.set(rootKey, Math.max(0, recordFiles.length - deletedRecords));
+    return { deletedRecords, deletedTranscripts };
+  } finally {
+    pruningRoots.delete(rootKey);
+  }
+}
+
+export async function pruneOldSwitchArtifacts(
+  maxRetained = DEFAULT_MAX_RETAINED_RECORDS,
+  root?: string,
+): Promise<{ deletedRecords: number; deletedTranscripts: number }> {
+  return pruneOldSwitchArtifactsInternal(maxRetained, root, 0);
 }
 
 export async function loadSwitchRecord(
@@ -238,6 +379,8 @@ export async function loadSwitchRecord(
 ): Promise<PersistedSwitchRecord | null> {
   if (!VALID_SWITCH_ID.test(switchId)) return null;
   const recordPath = path.join(recordsDir(root), `${switchId}.json`);
+  const cached = getCachedRecord(recordPath);
+  if (cached) return cached;
   try {
     const raw = await fs.readFile(recordPath, "utf8");
     const parsed = JSON.parse(raw) as PersistedSwitchRecord;
@@ -257,6 +400,7 @@ export async function loadSwitchRecord(
         },
       ];
     }
+    setCachedRecord(recordPath, parsed);
     return parsed;
   } catch {
     return null;
@@ -274,36 +418,39 @@ export async function readTranscriptSlice(
   if (options?.query && options.query.trim().length > 0) {
     const needle = options.query.trim().toLowerCase();
     const lines = content.split("\n");
-    const matchedIndices = new Set<number>();
-    for (let i = 0; i < lines.length; i++) {
-      if (lines[i].toLowerCase().includes(needle)) {
-        for (let j = Math.max(0, i - 3); j <= Math.min(lines.length - 1, i + 6); j++) {
-          matchedIndices.add(j);
+    const out: string[] = [];
+    let lastEmitted = -2;
+    let chars = 0;
+    let truncated = false;
+    let foundAny = false;
+
+    for (let i = 0; i < lines.length && !truncated; i++) {
+      if (!lines[i].toLowerCase().includes(needle)) continue;
+      foundAny = true;
+      const winStart = Math.max(0, i - 3);
+      const winEnd = Math.min(lines.length - 1, i + 6);
+      const start = Math.max(winStart, lastEmitted + 1);
+      for (let j = start; j <= winEnd; j++) {
+        const line = `[L${j + 1}] ${lines[j]}`;
+        if (chars + line.length + 1 > limit) {
+          truncated = true;
+          break;
         }
+        if (j > lastEmitted + 1 && out.length > 0) {
+          out.push("...");
+        }
+        out.push(line);
+        chars += line.length + 1;
+        lastEmitted = j;
       }
     }
-    if (matchedIndices.size === 0) {
+
+    if (!foundAny) {
       return {
         text: `No matches found for "${options.query}" in transcript (${totalChars} chars).`,
         totalChars,
         truncated: false,
       };
-    }
-    const sorted = Array.from(matchedIndices).sort((a, b) => a - b);
-    const out: string[] = [];
-    let prev = -2;
-    let chars = 0;
-    let truncated = false;
-    for (const idx of sorted) {
-      if (idx > prev + 1 && out.length > 0) out.push("...");
-      const line = `[L${idx + 1}] ${lines[idx]}`;
-      if (chars + line.length + 1 > limit) {
-        truncated = true;
-        break;
-      }
-      out.push(line);
-      chars += line.length + 1;
-      prev = idx;
     }
     return { text: out.join("\n"), totalChars, truncated };
   }
@@ -341,23 +488,37 @@ export async function readAcrossHops(
   const limit = Math.max(500, Math.min(options.limit ?? 12000, 32000));
 
   if (options.hop === "all" && options.query && options.query.trim().length > 0) {
+    const perHopLimit = Math.min(limit, Math.floor(limit / Math.max(1, hops.length)) + 1500);
+    const reversedHops = [...hops].reverse();
+    const hopBlocks = await Promise.all(
+      reversedHops.map(async (h) => {
+        try {
+          const res = await readTranscriptSlice(h.transcriptPath, {
+            query: options.query,
+            limit: perHopLimit,
+          });
+          if (!res.text.startsWith("No matches found")) {
+            return `### Hop #${h.hop}: ${h.fromProvider}/${h.fromModel} (${h.turnsInSegment} turns)\n${res.text}`;
+          }
+        } catch {
+          // Ignore missing historical transcript
+        }
+        return null;
+      }),
+    );
+
     const sections: string[] = [];
     let remaining = limit;
-    for (let i = hops.length - 1; i >= 0 && remaining > 400; i--) {
-      const h = hops[i];
-      try {
-        const res = await readTranscriptSlice(h.transcriptPath, {
-          query: options.query,
-          limit: Math.min(remaining, Math.floor(limit / Math.max(1, hops.length)) + 1500),
-        });
-        if (!res.text.startsWith("No matches found")) {
-          const block = `### Hop #${h.hop}: ${h.fromProvider}/${h.fromModel} (${h.turnsInSegment} turns)\n${res.text}`;
-          sections.push(block);
-          remaining -= block.length + 2;
-        }
-      } catch {
-        // Ignore missing historical transcript
+    for (const block of hopBlocks) {
+      if (!block) continue;
+      if (remaining <= 400 && sections.length > 0) break;
+      if (block.length > remaining && sections.length > 0) {
+        sections.push(block.slice(0, remaining));
+        remaining = 0;
+        break;
       }
+      sections.push(block);
+      remaining -= block.length + 2;
     }
     if (sections.length === 0) {
       return {
@@ -396,21 +557,50 @@ export async function readAcrossHops(
 }
 
 export async function loadPreferences(root?: string): Promise<UserModelPreferences> {
+  const rootKey = getDataRoot(root);
+  const filePath = preferencesPath(root);
+  const cached = preferencesCache.get(rootKey);
   try {
-    const raw = await fs.readFile(preferencesPath(root), "utf8");
+    if (cached) {
+      const st = await fs.stat(filePath).catch(() => null);
+      if ((st ? st.mtimeMs : null) === cached.mtimeMs) {
+        setCachedPreferences(rootKey, cached);
+        return {
+          recent: [...cached.prefs.recent],
+          pinned: [...cached.prefs.pinned],
+        };
+      }
+    }
+    const [raw, st] = await Promise.all([
+      fs.readFile(filePath, "utf8"),
+      fs.stat(filePath).catch(() => null),
+    ]);
     const parsed = JSON.parse(raw) as Partial<UserModelPreferences>;
-    return {
+    const prefs: UserModelPreferences = {
       recent: Array.isArray(parsed.recent) ? parsed.recent.slice(0, MAX_RECENT_MODELS) : [],
       pinned: Array.isArray(parsed.pinned) ? parsed.pinned.slice(0, MAX_PINNED_MODELS) : [],
     };
+    setCachedPreferences(rootKey, { prefs, mtimeMs: st ? st.mtimeMs : null });
+    return {
+      recent: [...prefs.recent],
+      pinned: [...prefs.pinned],
+    };
   } catch {
+    const empty: UserModelPreferences = { recent: [], pinned: [] };
+    setCachedPreferences(rootKey, { prefs: empty, mtimeMs: null });
     return { recent: [], pinned: [] };
   }
 }
 
-async function savePreferencesAtomic(prefs: UserModelPreferences, root?: string): Promise<void> {
-  await fs.mkdir(getDataRoot(root), { recursive: true });
-  await writeFileAtomic(preferencesPath(root), JSON.stringify(prefs, null, 2));
+async function savePreferencesAtomic(
+  prefs: UserModelPreferences,
+  root?: string,
+): Promise<number | null> {
+  await ensureDir(getDataRoot(root));
+  const filePath = preferencesPath(root);
+  await writeFileAtomic(filePath, JSON.stringify(prefs, null, 2));
+  const st = await fs.stat(filePath).catch(() => null);
+  return st ? st.mtimeMs : null;
 }
 
 export function recordRecentModel(item: ModelRef, root?: string): Promise<ModelRef[]> {
@@ -424,7 +614,9 @@ export function recordRecentModel(item: ModelRef, root?: string): Promise<ModelR
       { ...item, usedAt: new Date().toISOString() },
       ...filtered,
     ].slice(0, MAX_RECENT_MODELS);
-    await savePreferencesAtomic({ ...prefs, recent: next }, root);
+    const updated: UserModelPreferences = { ...prefs, recent: next };
+    const mtimeMs = await savePreferencesAtomic(updated, root);
+    setCachedPreferences(rootKey, { prefs: updated, mtimeMs });
     return next;
   });
 }
@@ -445,7 +637,9 @@ export function togglePinnedModel(
         )
       : [{ ...item, usedAt: new Date().toISOString() }, ...prefs.pinned].slice(0, MAX_PINNED_MODELS);
 
-    await savePreferencesAtomic({ ...prefs, pinned: next }, root);
+    const updated: UserModelPreferences = { ...prefs, pinned: next };
+    const mtimeMs = await savePreferencesAtomic(updated, root);
+    setCachedPreferences(rootKey, { prefs: updated, mtimeMs });
     return { pinned: !exists, items: next };
   });
 }

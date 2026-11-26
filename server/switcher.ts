@@ -33,7 +33,7 @@ import {
   type ModelSwitchSettings,
   type ModelSwitchSettingsSchema,
 } from "../shared/settings";
-import { compileSessionContext } from "./context";
+import { collectGitWorkspaceContext, compileContextFromEntries } from "./context";
 import { resolveModeAndOptionsForTarget } from "./mode-map";
 import {
   generateSwitchId,
@@ -113,13 +113,137 @@ function toCatalogModes(modes: readonly AgentMode[] | undefined): CatalogMode[] 
   });
 }
 
+type ProviderSnapshot = Awaited<ReturnType<PaseoApi["providers"]["snapshot"]>>;
+
+const PROVIDER_SNAPSHOT_TTL_MS = 8_000;
+const PROVIDER_SNAPSHOT_LOADING_TTL_MS = 1_000;
+const MAX_PROVIDER_SNAPSHOT_CACHE = 16;
+
+const providerSnapshotCache = new Map<string, { snapshot: ProviderSnapshot; expiresAt: number }>();
+const providerSnapshotInFlight = new Map<string, Promise<ProviderSnapshot>>();
+
+const READ_PREVIOUS_SESSION_CONTEXT_INPUT_SCHEMA = z.object({
+  action: z
+    .enum(["read", "search", "list_hops"])
+    .optional()
+    .describe("Operation mode (default: 'search' when query is given, else 'read')."),
+  hop: z
+    .union([z.number().int().min(1), z.literal("all")])
+    .optional()
+    .describe("Which switch hop to inspect (default: latest hop; 'all' searches every hop)."),
+  query: z
+    .string()
+    .optional()
+    .describe("Case-insensitive keyword to search across transcript(s)."),
+  offset: z
+    .number()
+    .int()
+    .min(0)
+    .optional()
+    .describe("Character offset when paging through a transcript."),
+  limit: z
+    .number()
+    .int()
+    .min(500)
+    .max(32000)
+    .optional()
+    .describe("Maximum characters to return (default 12000)."),
+});
+
+async function getCachedProviderSnapshot(
+  paseo: PaseoApi,
+  cwd?: string,
+): Promise<ProviderSnapshot> {
+  const key = cwd ?? "";
+  const now = Date.now();
+  const cached = providerSnapshotCache.get(key);
+  if (cached && cached.expiresAt > now) {
+    return cached.snapshot;
+  }
+
+  const inFlight = providerSnapshotInFlight.get(key);
+  if (inFlight) {
+    return inFlight;
+  }
+
+  const cwdOpt = cwd ? { cwd } : undefined;
+  const promise = paseo.providers
+    .snapshot(cwdOpt)
+    .then((snapshot) => {
+      const hasLoading = snapshot.entries.some(
+        (entry) => entry.enabled && entry.status === "loading",
+      );
+      const ttl = hasLoading ? PROVIDER_SNAPSHOT_LOADING_TTL_MS : PROVIDER_SNAPSHOT_TTL_MS;
+      if (providerSnapshotCache.has(key)) {
+        providerSnapshotCache.delete(key);
+      }
+      providerSnapshotCache.set(key, { snapshot, expiresAt: Date.now() + ttl });
+      if (providerSnapshotCache.size > MAX_PROVIDER_SNAPSHOT_CACHE) {
+        const oldestKey = providerSnapshotCache.keys().next().value;
+        if (oldestKey !== undefined) providerSnapshotCache.delete(oldestKey);
+      }
+      return snapshot;
+    })
+    .finally(() => {
+      if (providerSnapshotInFlight.get(key) === promise) {
+        providerSnapshotInFlight.delete(key);
+      }
+    });
+
+  providerSnapshotInFlight.set(key, promise);
+  return promise;
+}
+
+async function resolveTargetProvider(
+  paseo: PaseoApi,
+  targetProvider: string,
+  cwd?: string,
+): Promise<CatalogProvider | null> {
+  const cwdOpt = cwd ? { cwd } : undefined;
+  const snapshot = await getCachedProviderSnapshot(paseo, cwd);
+  const entry = snapshot.entries.find(
+    (e) =>
+      e.provider === targetProvider &&
+      e.enabled &&
+      (e.status === "ready" || e.status === "loading"),
+  );
+  if (!entry) return null;
+
+  const [rawModels, rawModes] = await Promise.all([
+    (entry.models?.length ?? 0) > 0 || entry.status !== "ready"
+      ? Promise.resolve(entry.models ?? [])
+      : paseo.providers
+          .listModels(entry.provider, cwdOpt)
+          .then((r) => r.models ?? [])
+          .catch(() => []),
+    (entry.modes?.length ?? 0) > 0 || entry.status !== "ready"
+      ? Promise.resolve(entry.modes ?? [])
+      : paseo.providers
+          .listModes(entry.provider, cwdOpt)
+          .then((r) => r.modes ?? [])
+          .catch(() => []),
+  ]);
+
+  const models = toCatalogModels(rawModels);
+  if (models.length === 0) return null;
+
+  return {
+    id: entry.provider,
+    label: entry.label || entry.provider,
+    status: entry.status,
+    defaultModeId: entry.defaultModeId ?? null,
+    modes: toCatalogModes(rawModes),
+    models,
+  };
+}
+
 export async function handleListCatalog(
   input: RpcInput<typeof listCatalogRpc>,
   paseo: PaseoApi,
 ): Promise<RpcOutput<typeof listCatalogRpc>> {
   const cwdOpt = input.cwd ? { cwd: input.cwd } : undefined;
   const [snapshot, prefs] = await Promise.all([
-    paseo.providers.snapshot(cwdOpt),
+    getCachedProviderSnapshot(paseo, input.cwd),
     loadPreferences(),
   ]);
 
@@ -211,10 +335,18 @@ async function isExecutable(filePath: string): Promise<boolean> {
   }
 }
 
+let cachedPaseoCliBinary: string | null = null;
+let cachedPaseoCliEnv: string | undefined;
+
 async function resolvePaseoCliBinary(): Promise<string> {
+  const envCli = process.env.PASEO_CLI?.trim();
+  if (cachedPaseoCliBinary && cachedPaseoCliEnv === envCli) {
+    return cachedPaseoCliBinary;
+  }
+
   const candidates: string[] = [];
-  if (process.env.PASEO_CLI?.trim()) {
-    candidates.push(process.env.PASEO_CLI.trim());
+  if (envCli) {
+    candidates.push(envCli);
   }
   const appMarker = ".app/Contents/";
   const appIdx = process.execPath.indexOf(appMarker);
@@ -227,9 +359,13 @@ async function resolvePaseoCliBinary(): Promise<string> {
 
   for (const candidate of candidates) {
     if (await isExecutable(candidate)) {
+      cachedPaseoCliBinary = candidate;
+      cachedPaseoCliEnv = envCli;
       return candidate;
     }
   }
+  cachedPaseoCliBinary = "paseo";
+  cachedPaseoCliEnv = envCli;
   return "paseo";
 }
 
@@ -299,9 +435,11 @@ export async function handleSwitchModel(
   settingsHandle: PluginSettings<typeof ModelSwitchSettingsSchema>,
   turnCache: IncrementalTimelineCache,
 ): Promise<RpcOutput<typeof switchModelRpc>> {
-  const settings = await readCurrentSettings(settingsHandle);
   const sourceHandle = paseo.agents.ref(input.agentId);
-  const refreshed = await sourceHandle.refresh();
+  const [settings, refreshed] = await Promise.all([
+    readCurrentSettings(settingsHandle),
+    sourceHandle.refresh(),
+  ]);
   let sourceAgent = refreshed?.agent ?? sourceHandle.current();
 
   if (!sourceAgent) {
@@ -329,26 +467,34 @@ export async function handleSwitchModel(
   const sourceThinkingOptionId =
     sourceAgent.thinkingOptionId ?? sourceAgent.runtimeInfo?.thinkingOptionId ?? null;
 
-  const catalog = await handleListCatalog({ cwd }, paseo);
-  const targetProviderEntry = catalog.providers.find((p) => p.id === input.targetProvider);
+  const ancestorSwitchId = readStringMeta(sourceAgent.metadata, sourceAgent.labels, SWITCH_META_KEY);
+
+  const [targetProviderEntry, ancestor, entries, git] = await Promise.all([
+    resolveTargetProvider(paseo, input.targetProvider, cwd),
+    ancestorSwitchId ? loadSwitchRecord(ancestorSwitchId) : Promise.resolve(null),
+    turnCache.fetchFullTimeline(paseo, sourceAgent.id),
+    collectGitWorkspaceContext(
+      cwd,
+      settings.includeGitContext,
+      settings.includeUncommittedPatch,
+    ),
+  ]);
+
   if (!targetProviderEntry) {
     throw new Error(`目标 Provider 不可用或未就绪: ${input.targetProvider}`);
   }
   const targetModelEntry = targetProviderEntry.models.find((m) => m.id === input.targetModel);
   const resolvedTargetModel = targetModelEntry?.id ?? input.targetModel;
 
-  const ancestorSwitchId = readStringMeta(sourceAgent.metadata, sourceAgent.labels, SWITCH_META_KEY);
-  const ancestor = ancestorSwitchId ? await loadSwitchRecord(ancestorSwitchId) : null;
   const hopCount = (ancestor?.hopCount ?? 0) + 1;
 
   const switchId = generateSwitchId();
   const plannedTranscriptPath = path.join(getDataRoot(), "transcripts", `${switchId}.md`);
   const cleanNote = input.handoffNote?.trim() || undefined;
 
-  const compiled = await compileSessionContext({
-    paseo,
-    turnCache,
-    agentId: sourceAgent.id,
+  const compiled = compileContextFromEntries({
+    entries,
+    git,
     cwd,
     sourceProvider,
     sourceModel,
@@ -397,6 +543,13 @@ export async function handleSwitchModel(
   let savedBannerData: SwitchBannerData | undefined;
   let turnsCarried = 0;
 
+  const recordRecentTask = recordRecentModel({
+    provider: input.targetProvider,
+    model: resolvedTargetModel,
+    thinkingOptionId: input.targetThinkingOptionId ?? targetModelEntry?.defaultThinkingOptionId,
+    label: targetModelEntry?.label ?? resolvedTargetModel,
+  });
+
   // Zero-noise fast path: empty unstarted session needs no synthetic briefing, file artifact, or "0 turns" banner
   if (!compiled.isEmptySession) {
     const priorTranscriptPaths = [
@@ -423,45 +576,43 @@ export async function handleSwitchModel(
       previewTurns: compiled.previewTurns,
     };
 
-    const savedRecord = await saveSwitchArtifacts({
-      record: {
-        switchId,
-        createdAt: new Date().toISOString(),
-        fromAgentId: sourceAgent.id,
-        fromProvider: sourceProvider,
-        fromModel: sourceModel,
-        fromThinkingOptionId: sourceThinkingOptionId,
-        toProvider: input.targetProvider,
-        toModel: resolvedTargetModel,
-        hopCount,
-        totalTurns: compiled.turns.length,
-        turnsCarried,
-        hasOmittedHistory: compiled.hasOmittedHistory,
-        filesTouched: compiled.filesTouched,
-        gitBranch: compiled.git.branch,
-        systemPromptBriefing: compiled.systemPromptBriefing,
-        handoffNote: cleanNote,
-        priorTranscriptPaths,
-        priorHops: ancestor?.hops ?? [],
-        ancestorSummary: compiled.ancestorSummary,
-        bannerData: baseBannerData,
-      },
-      transcriptMarkdown: compiled.transcriptMarkdown,
-    });
+    const [savedRecord] = await Promise.all([
+      saveSwitchArtifacts({
+        record: {
+          switchId,
+          createdAt: new Date().toISOString(),
+          fromAgentId: sourceAgent.id,
+          fromProvider: sourceProvider,
+          fromModel: sourceModel,
+          fromThinkingOptionId: sourceThinkingOptionId,
+          toProvider: input.targetProvider,
+          toModel: resolvedTargetModel,
+          hopCount,
+          totalTurns: compiled.turns.length,
+          turnsCarried,
+          hasOmittedHistory: compiled.hasOmittedHistory,
+          filesTouched: compiled.filesTouched,
+          gitBranch: compiled.git.branch,
+          systemPromptBriefing: compiled.systemPromptBriefing,
+          handoffNote: cleanNote,
+          priorTranscriptPaths,
+          priorHops: ancestor?.hops ?? [],
+          ancestorSummary: compiled.ancestorSummary,
+          bannerData: baseBannerData,
+        },
+        transcriptMarkdown: compiled.transcriptMarkdown,
+      }),
+      recordRecentTask,
+    ]);
 
     savedTranscriptPath = savedRecord.transcriptPath;
     savedBannerData = savedRecord.bannerData;
     nextLabels[SWITCH_META_KEY] = switchId;
     nextMetadata[SWITCH_META_KEY] = switchId;
     nextMetadata[SWITCH_HOP_META_KEY] = hopCount;
+  } else {
+    await recordRecentTask;
   }
-
-  await recordRecentModel({
-    provider: input.targetProvider,
-    model: resolvedTargetModel,
-    thinkingOptionId: input.targetThinkingOptionId ?? targetModelEntry?.defaultThinkingOptionId,
-    label: targetModelEntry?.label ?? resolvedTargetModel,
-  });
 
   const thinkingOptionId =
     input.targetThinkingOptionId ?? targetModelEntry?.defaultThinkingOptionId ?? undefined;
@@ -505,37 +656,41 @@ export async function handleSwitchModel(
         prompt: cleanFollowUp,
       });
 
-  if (settings.showSwitchBanner && savedBannerData) {
-    try {
-      await newAgentHandle.timeline.append({
-        type: "plugin",
-        id: `model-switch-${switchId}`,
-        kind: SWITCH_BANNER_KIND,
-        version: 1,
-        data: savedBannerData as unknown as JsonValue,
-      });
-    } catch (error) {
-      console.error("[model-switch] Failed to append timeline banner:", error);
-    }
-  }
+  const bannerTask =
+    settings.showSwitchBanner && savedBannerData
+      ? newAgentHandle.timeline
+          .append({
+            type: "plugin",
+            id: `model-switch-${switchId}`,
+            kind: SWITCH_BANNER_KIND,
+            version: 1,
+            data: savedBannerData as unknown as JsonValue,
+          })
+          .catch((error) => {
+            console.error("[model-switch] Failed to append timeline banner:", error);
+          })
+      : Promise.resolve();
 
   const shouldArchive = input.archivePreviousOverride ?? settings.archivePreviousAgent;
-  let archivedPrevious = false;
-  let archiveSkippedReason: string | undefined;
+  const archiveTask: Promise<{ archivedPrevious: boolean; archiveSkippedReason?: string }> =
+    shouldArchive
+      ? (async () => {
+          const protectionReason = await detectArchiveProtectionReason(paseo, sourceAgent);
+          if (protectionReason) {
+            return { archivedPrevious: false, archiveSkippedReason: protectionReason };
+          }
+          try {
+            await sourceHandle.archive();
+            return { archivedPrevious: true };
+          } catch (error) {
+            console.error("[model-switch] Failed to archive previous agent:", error);
+            return { archivedPrevious: false };
+          }
+        })()
+      : Promise.resolve({ archivedPrevious: false });
 
-  if (shouldArchive) {
-    const protectionReason = await detectArchiveProtectionReason(paseo, sourceAgent);
-    if (protectionReason) {
-      archiveSkippedReason = protectionReason;
-    } else {
-      try {
-        await sourceHandle.archive();
-        archivedPrevious = true;
-      } catch (error) {
-        console.error("[model-switch] Failed to archive previous agent:", error);
-      }
-    }
-  }
+  const [, archiveResult] = await Promise.all([bannerTask, archiveTask]);
+  const { archivedPrevious, archiveSkippedReason } = archiveResult;
 
   return {
     kind: "migrated",
@@ -628,7 +783,10 @@ export function registerSessionOpenHook(
   server: PluginServerContext,
   settingsHandle: PluginSettings<typeof ModelSwitchSettingsSchema>,
 ): () => void {
-  return server.addHook("agent.open.before", async ({ request }, { paseo }) => {
+  const pendingTimers = new Set<ReturnType<typeof setTimeout>>();
+  let disposed = false;
+
+  const removeHook = server.addHook("agent.open.before", async ({ request }, { paseo }) => {
     if (request.purpose !== "interactive") return;
 
     const switchId = readStringMeta(request.metadata, request.labels, SWITCH_META_KEY);
@@ -638,12 +796,16 @@ export function registerSessionOpenHook(
     if (!record || !record.systemPromptBriefing) return;
 
     if (request.reason === "resume" && record.bannerData) {
-      const settings = await readCurrentSettings(settingsHandle);
-      if (settings.showSwitchBanner) {
-        setTimeout(() => {
-          void rehydrateBannerIfEmptyTimeline(paseo, request.agentId, switchId, record.bannerData!);
-        }, 400);
-      }
+      const bannerData = record.bannerData;
+      const timer = setTimeout(() => {
+        pendingTimers.delete(timer);
+        if (disposed) return;
+        void readCurrentSettings(settingsHandle).then((settings) => {
+          if (disposed || !settings.showSwitchBanner) return;
+          return rehydrateBannerIfEmptyTimeline(paseo, request.agentId, switchId, bannerData);
+        });
+      }, 400);
+      pendingTimers.add(timer);
     }
 
     const shouldAttachTool = record.hasOmittedHistory !== false;
@@ -655,33 +817,7 @@ export function registerSessionOpenHook(
         title: "Read Previous Session Context",
         description:
           "Inspect or search full verbatim conversation transcripts from before this session switched models (supports multi-hop chains). Use action='list_hops' to view all prior model segments, action='search' with query and optional hop='all', or action='read' with offset/limit.",
-        input: z.object({
-          action: z
-            .enum(["read", "search", "list_hops"])
-            .optional()
-            .describe("Operation mode (default: 'search' when query is given, else 'read')."),
-          hop: z
-            .union([z.number().int().min(1), z.literal("all")])
-            .optional()
-            .describe("Which switch hop to inspect (default: latest hop; 'all' searches every hop)."),
-          query: z
-            .string()
-            .optional()
-            .describe("Case-insensitive keyword to search across transcript(s)."),
-          offset: z
-            .number()
-            .int()
-            .min(0)
-            .optional()
-            .describe("Character offset when paging through a transcript."),
-          limit: z
-            .number()
-            .int()
-            .min(500)
-            .max(32000)
-            .optional()
-            .describe("Maximum characters to return (default 12000)."),
-        }),
+        input: READ_PREVIOUS_SESSION_CONTEXT_INPUT_SCHEMA,
         async execute(args) {
           const effectiveAction =
             args.action ?? (args.query && args.query.trim().length > 0 ? "search" : "read");
@@ -703,4 +839,13 @@ export function registerSessionOpenHook(
       tools: nextTools,
     };
   });
+
+  return () => {
+    disposed = true;
+    for (const timer of pendingTimers) {
+      clearTimeout(timer);
+    }
+    pendingTimers.clear();
+    removeHook();
+  };
 }

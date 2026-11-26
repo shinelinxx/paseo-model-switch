@@ -25,12 +25,40 @@ import { getTriggerStyle, setTriggerStyle, subscribeTriggerStyle } from "./clien
 
 interface TrackedAgentInfo {
   id: string;
+  workspaceId: string | null;
+  provider: string;
+  model: string | null;
+  archivedAt: string | null;
+  background: boolean;
+  hopCount: number | undefined;
+}
+
+interface PillEntry {
+  reg: PluginButtonRegistration;
+  title: string;
+  label: string;
+  workspaceId: string;
+}
+
+function projectTrackedAgent(agent: {
+  id: string;
   workspaceId?: string | null;
   provider: string;
   model?: string | null;
   archivedAt?: string | null;
   background?: boolean;
   metadata?: Readonly<Record<string, JsonValue>> | null;
+}): TrackedAgentInfo {
+  const rawHop = agent.metadata?.[SWITCH_HOP_META_KEY];
+  return {
+    id: agent.id,
+    workspaceId: agent.workspaceId ?? null,
+    provider: agent.provider,
+    model: agent.model ?? null,
+    archivedAt: agent.archivedAt ?? null,
+    background: Boolean(agent.background),
+    hopCount: typeof rawHop === "number" ? rawHop : undefined,
+  };
 }
 
 function formatCompactPillLabel(hopCount?: number): string {
@@ -178,59 +206,66 @@ export default function contribute(client: PluginClientContext) {
     onSubmit: handleSlashSubmit,
   });
 
-  const pills = new Map<string, PluginButtonRegistration>();
+  const pills = new Map<string, PillEntry>();
   const trackedAgents = new Map<string, TrackedAgentInfo>();
   const lifetime = new AbortController();
+  let styleReady = false;
+  let unsubscribeAgents: (() => void) | null = null;
 
   const syncPillForAgent = (agent: TrackedAgentInfo, style: ComposerTriggerStyle) => {
-    if (lifetime.signal.aborted) return;
+    if (lifetime.signal.aborted || !styleReady) return;
 
-    const hopCount =
-      typeof agent.metadata?.[SWITCH_HOP_META_KEY] === "number"
-        ? (agent.metadata[SWITCH_HOP_META_KEY] as number)
-        : undefined;
-
+    const hopCount = agent.hopCount;
     const shouldShow =
       Boolean(agent.workspaceId) &&
       !agent.archivedAt &&
       !agent.background &&
       (style === "compact" || (style === "when-switched" && Boolean(hopCount && hopCount >= 1)));
 
+    const existing = pills.get(agent.id);
     if (!shouldShow || !agent.workspaceId) {
-      pills.get(agent.id)?.remove();
-      pills.delete(agent.id);
+      if (existing) {
+        existing.reg.remove();
+        pills.delete(agent.id);
+      }
       return;
     }
 
-    const existing = pills.get(agent.id);
     const label = formatCompactPillLabel(hopCount);
     const title = `切换模型（当前：${agent.provider}/${agent.model || "default"}${hopCount ? ` · 第 ${hopCount} 次接力` : ""}）`;
 
     if (existing) {
-      existing.update({ title, label });
-      return;
+      if (existing.workspaceId === agent.workspaceId) {
+        if (existing.title !== title || existing.label !== label) {
+          existing.reg.update({ title, label });
+          existing.title = title;
+          existing.label = label;
+        }
+        return;
+      }
+      existing.reg.remove();
+      pills.delete(agent.id);
     }
 
-    pills.set(
-      agent.id,
-      client.addComposerPill({
-        id: "model-switch-pill",
-        workspaceId: agent.workspaceId,
-        agentId: agent.id,
-        button: {
-          title,
-          label,
-          icon: "ArrowLeftRight",
-          behavior: {
-            kind: "popover",
-            Content: SwitcherPopover,
-          },
+    const reg = client.addComposerPill({
+      id: "model-switch-pill",
+      workspaceId: agent.workspaceId,
+      agentId: agent.id,
+      button: {
+        title,
+        label,
+        icon: "ArrowLeftRight",
+        behavior: {
+          kind: "popover",
+          Content: SwitcherPopover,
         },
-      }),
-    );
+      },
+    });
+    pills.set(agent.id, { reg, title, label, workspaceId: agent.workspaceId });
   };
 
   const syncAllPills = (style: ComposerTriggerStyle) => {
+    if (lifetime.signal.aborted || !styleReady) return;
     for (const agent of trackedAgents.values()) {
       syncPillForAgent(agent, style);
     }
@@ -238,51 +273,81 @@ export default function contribute(client: PluginClientContext) {
 
   const removeAllPills = () => {
     for (const pill of pills.values()) {
-      pill.remove();
+      pill.reg.remove();
     }
     pills.clear();
   };
 
   const unsubscribeStyle = subscribeTriggerStyle((style) => {
+    styleReady = true;
     syncAllPills(style);
   });
 
-  // Load persisted trigger style once on startup so pills honor user's saved preference immediately
+  // Gate initial pill creation on startup settings read so pills never mount-then-unmount flicker
   void client
     .rpc(settingsRpc("model-switch").read, {})
     .then((res) => {
-      if (lifetime.signal.aborted || res.status !== "ready") return;
-      const values = res.values as Record<string, unknown> | null;
-      const parsed = ComposerTriggerStyleSchema.safeParse(values?.composerTriggerStyle);
-      if (parsed.success) {
-        setTriggerStyle(parsed.data);
+      if (lifetime.signal.aborted) return;
+      if (res.status === "ready") {
+        const values = res.values as Record<string, unknown> | null;
+        const parsed = ComposerTriggerStyleSchema.safeParse(values?.composerTriggerStyle);
+        if (parsed.success) {
+          setTriggerStyle(parsed.data);
+        }
       }
     })
-    .catch(() => undefined);
+    .catch(() => undefined)
+    .finally(() => {
+      if (lifetime.signal.aborted) return;
+      if (!styleReady) {
+        styleReady = true;
+        syncAllPills(getTriggerStyle());
+      }
+    });
 
   void client.paseo.agents
-    .list({ subscribe: {}, signal: lifetime.signal })
+    .list({ scope: "active", subscribe: {}, signal: lifetime.signal })
     .then(({ subscription }) => {
-      subscription.subscribe({
+      if (lifetime.signal.aborted) {
+        void subscription.release().catch(() => undefined);
+        return undefined;
+      }
+      unsubscribeAgents = subscription.subscribe({
         snapshot: ({ entries }) => {
-          removeAllPills();
-          trackedAgents.clear();
+          const nextIds = new Set<string>();
           const style = getTriggerStyle();
           for (const { agent } of entries) {
-            trackedAgents.set(agent.id, agent);
-            syncPillForAgent(agent, style);
+            const projected = projectTrackedAgent(agent);
+            nextIds.add(projected.id);
+            trackedAgents.set(projected.id, projected);
+            syncPillForAgent(projected, style);
+          }
+          for (const existingId of Array.from(trackedAgents.keys())) {
+            if (!nextIds.has(existingId)) {
+              trackedAgents.delete(existingId);
+            }
+          }
+          for (const [pillAgentId, pill] of Array.from(pills.entries())) {
+            if (!nextIds.has(pillAgentId)) {
+              pill.reg.remove();
+              pills.delete(pillAgentId);
+            }
           }
         },
         update: (message) => {
           if (message.type !== "agent_update") return;
           const update = message.payload;
           if (update.kind === "upsert") {
-            trackedAgents.set(update.agent.id, update.agent);
-            syncPillForAgent(update.agent, getTriggerStyle());
+            const projected = projectTrackedAgent(update.agent);
+            trackedAgents.set(projected.id, projected);
+            syncPillForAgent(projected, getTriggerStyle());
           } else {
             trackedAgents.delete(update.agentId);
-            pills.get(update.agentId)?.remove();
-            pills.delete(update.agentId);
+            const existing = pills.get(update.agentId);
+            if (existing) {
+              existing.reg.remove();
+              pills.delete(update.agentId);
+            }
           }
         },
       });
@@ -296,6 +361,8 @@ export default function contribute(client: PluginClientContext) {
 
   return () => {
     lifetime.abort();
+    unsubscribeAgents?.();
+    unsubscribeAgents = null;
     unsubscribeStyle();
     removeAllPills();
     trackedAgents.clear();
