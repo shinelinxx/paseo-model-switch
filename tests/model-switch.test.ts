@@ -842,4 +842,109 @@ describe("handoff agent_message preservation, initial task anchor, and output fi
       await fs.rm(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it("deduplicates filesTouched across outputFiles/edited/read, filters SKILL.md, and passes through 0-turn hops losslessly", () => {
+    const entries: Array<{ item: AgentTimelineItem; timestamp: string; seqStart: number }> = [
+      {
+        seqStart: 1,
+        timestamp: "2026-11-26T04:00:00Z",
+        item: { type: "user_message", text: "Update warmup script" },
+      },
+      {
+        seqStart: 2,
+        timestamp: "2026-11-26T04:00:02Z",
+        item: {
+          type: "tool_call",
+          callId: "r1",
+          name: "read",
+          status: "completed",
+          error: null,
+          detail: { type: "read", filePath: "/Users/test/.gemini/config/skills/paseo/SKILL.md" },
+        },
+      },
+      {
+        seqStart: 3,
+        timestamp: "2026-11-26T04:00:05Z",
+        item: {
+          type: "tool_call",
+          callId: "e1",
+          name: "edit",
+          status: "completed",
+          error: null,
+          detail: { type: "edit", filePath: "/Users/test/scratch/warmup.mjs" },
+        },
+      },
+      {
+        seqStart: 4,
+        timestamp: "2026-11-26T04:00:08Z",
+        item: { type: "assistant_message", text: "Updated warmup.mjs." },
+      },
+    ];
+
+    const hop1 = compileContextFromEntries({
+      entries,
+      git: { branch: null, statusShort: "", diffStat: "", uncommittedPatch: "" },
+      cwd: "/Users/test/workspace",
+      sourceProvider: "antigravity",
+      sourceModel: "gemini-4-neon",
+      settings: DEFAULT_MODEL_SWITCH_SETTINGS,
+      outputFiles: [{ path: "/Users/test/scratch/warmup.mjs", origin: "modified", sizeBytes: 1200 }],
+      transcriptPathPlaceholder: "/tmp/hop1.md",
+    });
+
+    assert.deepEqual(hop1.filesTouched, ["warmup.mjs"]);
+
+    // 0-turn immediate re-switch (Hop 2) must pass through Hop 1 briefing & previewTurns losslessly
+    const hop2 = compileContextFromEntries({
+      entries: [],
+      git: { branch: null, statusShort: "", diffStat: "", uncommittedPatch: "" },
+      cwd: "/Users/test/workspace",
+      sourceProvider: "codex",
+      sourceModel: "gpt-6.2-sol",
+      settings: DEFAULT_MODEL_SWITCH_SETTINGS,
+      outputFiles: [{ path: "/Users/test/scratch/warmup.mjs", origin: "modified", sizeBytes: 1200 }],
+      ancestor: {
+        switchId: "sw_hop1",
+        createdAt: "2026-11-26T04:00:10Z",
+        fromAgentId: "ag_1",
+        fromProvider: "antigravity",
+        fromModel: "gemini-4-neon",
+        toProvider: "codex",
+        toModel: "gpt-6.2-sol",
+        hopCount: 1,
+        totalTurns: 1,
+        turnsCarried: 1,
+        hasOmittedHistory: false,
+        filesTouched: hop1.filesTouched,
+        outputFiles: hop1.outputFiles,
+        gitBranch: null,
+        transcriptPath: "/tmp/hop1.md",
+        systemPromptBriefing: hop1.systemPromptBriefing,
+        priorTranscriptPaths: [],
+        hops: [],
+        ancestorSummary: hop1.ancestorSummary,
+        bannerData: {
+          switchId: "sw_hop1",
+          fromProvider: "antigravity",
+          fromModel: "gemini-4-neon",
+          toProvider: "codex",
+          toModel: "gpt-6.2-sol",
+          turnsCarried: 1,
+          totalTurns: 1,
+          hopCount: 1,
+          filesTouched: hop1.filesTouched,
+          gitBranch: null,
+          modeMapped: "full-access",
+          transcriptPath: "/tmp/hop1.md",
+          previewTurns: hop1.previewTurns,
+        },
+      },
+      transcriptPathPlaceholder: "/tmp/hop2.md",
+    });
+
+    assert.equal(hop2.systemPromptBriefing, hop1.systemPromptBriefing);
+    assert.doesNotMatch(hop2.systemPromptBriefing, /No prior turns were recorded/);
+    assert.equal(hop2.previewTurns.length, hop1.previewTurns.length);
+    assert.deepEqual(hop2.filesTouched, ["warmup.mjs"]);
+  });
 });

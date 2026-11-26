@@ -1012,6 +1012,63 @@ function toBannerFileLabel(filePath: string, cwd: string): string {
   return path.basename(filePath) || filePath;
 }
 
+function buildDeduplicatedFilesTouched(input: {
+  cwd: string;
+  outputFiles: readonly SessionOutputFile[];
+  filesWritten: readonly string[];
+  filesEdited: readonly string[];
+  filesRead: readonly string[];
+  ancestorFilesTouched?: readonly string[];
+}): string[] {
+  const seenResolved = new Set<string>();
+  const seenLabels = new Set<string>();
+  const labels: string[] = [];
+
+  const addPath = (rawPath: string, allowIgnored = false) => {
+    const resolved = normalizeCandidatePath(rawPath, input.cwd) ?? rawPath.trim();
+    if (!resolved) return;
+    if (!allowIgnored && isIgnoredMentionedPath(resolved)) return;
+    if (seenResolved.has(resolved)) return;
+    seenResolved.add(resolved);
+
+    let label = toBannerFileLabel(resolved, input.cwd);
+    if (seenLabels.has(label)) {
+      const parent = path.basename(path.dirname(resolved));
+      if (parent && parent !== "." && parent !== "/") {
+        label = `${parent}/${label}`;
+      }
+    }
+    if (seenLabels.has(label)) return;
+    seenLabels.add(label);
+    labels.push(label);
+  };
+
+  for (const f of input.outputFiles) addPath(f.path, true);
+  for (const f of input.filesWritten) addPath(f, true);
+  for (const f of input.filesEdited) addPath(f, true);
+  for (const f of input.filesRead) addPath(f, false);
+  if (input.ancestorFilesTouched) {
+    for (const raw of input.ancestorFilesTouched) {
+      const clean = raw.trim();
+      if (!clean || isIgnoredMentionedPath(clean)) continue;
+      if (path.isAbsolute(clean) || clean.startsWith("~/")) {
+        const resolved = normalizeCandidatePath(clean, input.cwd) ?? clean;
+        if (seenResolved.has(resolved)) continue;
+        const label = toBannerFileLabel(resolved, input.cwd);
+        if (seenLabels.has(label)) continue;
+        seenResolved.add(resolved);
+        seenLabels.add(label);
+        labels.push(label);
+      } else if (!seenLabels.has(clean)) {
+        seenLabels.add(clean);
+        labels.push(clean);
+      }
+    }
+  }
+
+  return labels.slice(0, 40);
+}
+
 function formatTurnDigestLine(turn: CanonicalTurn): string {
   const parts: string[] = [];
   if (turn.userText) parts.push(`User: ${oneLine(turn.userText, 220)}`);
@@ -1194,17 +1251,72 @@ export function compileContextFromEntries(input: {
   const { turns, filesWritten, filesEdited, filesRead, latestTodos, latestPlan } =
     buildCanonicalTurns(input.entries);
   const outputFiles = input.outputFiles ?? [];
-  const filesTouched = Array.from(
-    new Set([
-      ...outputFiles.map((f) => toBannerFileLabel(f.path, input.cwd)),
-      ...filesWritten,
-      ...filesEdited,
-      ...filesRead,
-    ]),
-  ).slice(0, 40);
   const cleanNote = input.handoffNote?.trim();
   const isEmptySession =
     turns.length === 0 && outputFiles.length === 0 && !input.ancestor && !cleanNote;
+
+  // Lossless pass-through when switching back-to-back with 0 new turns on an already-switched session:
+  // carry forward the previous hop's verbatim briefing, previewTurns, and files instead of re-summarizing.
+  if (turns.length === 0 && input.ancestor && input.ancestor.systemPromptBriefing) {
+    const filesTouched = buildDeduplicatedFilesTouched({
+      cwd: input.cwd,
+      outputFiles,
+      filesWritten,
+      filesEdited,
+      filesRead,
+      ancestorFilesTouched: input.ancestor.filesTouched,
+    });
+    const extraSections: string[] = [];
+    if (cleanNote) {
+      extraSections.push(`## Additional Handoff Instruction\n${cleanNote}`);
+    }
+    if (
+      outputFiles.length > 0 &&
+      !input.ancestor.systemPromptBriefing.includes("## Project Output Files & Artifacts")
+    ) {
+      extraSections.push(
+        `## Project Output Files & Artifacts\n${formatOutputFileLines(outputFiles.slice(0, 24), true).join("\n")}`,
+      );
+    }
+    const systemPromptBriefing = [input.ancestor.systemPromptBriefing, ...extraSections].join(
+      "\n\n",
+    );
+    const transcriptMarkdown = buildFullTranscriptMarkdown({
+      sourceProvider: input.sourceProvider,
+      sourceModel: input.sourceModel,
+      cwd: input.cwd,
+      turns,
+      git: input.git,
+      filesTouched,
+      outputFiles,
+      latestTodos,
+      latestPlan,
+      handoffNote: cleanNote,
+      ancestor: input.ancestor,
+    });
+    return {
+      turns,
+      filesTouched,
+      outputFiles,
+      git: input.git,
+      latestTodos,
+      latestPlan,
+      isEmptySession: false,
+      hasOmittedHistory: Boolean(input.ancestor.hasOmittedHistory || input.ancestor.totalTurns > 0),
+      systemPromptBriefing,
+      transcriptMarkdown,
+      previewTurns: input.ancestor.bannerData?.previewTurns ?? [],
+      ancestorSummary: input.ancestor.ancestorSummary ?? "",
+    };
+  }
+
+  const filesTouched = buildDeduplicatedFilesTouched({
+    cwd: input.cwd,
+    outputFiles,
+    filesWritten,
+    filesEdited,
+    filesRead,
+  });
 
   // CJK-aware char budget so Chinese conversations respect target context windows accurately
   const textSample = turns

@@ -576,7 +576,13 @@ export async function handleSwitchModel(
       ...(ancestor?.transcriptPath ? [ancestor.transcriptPath] : []),
     ];
 
-    turnsCarried = Math.min(compiled.turns.length, settings.recentTurnsVerbatim);
+    const isZeroTurnPassthrough = compiled.turns.length === 0 && Boolean(ancestor);
+    const effectiveTotalTurns = isZeroTurnPassthrough
+      ? (ancestor?.totalTurns ?? 0)
+      : compiled.turns.length;
+    turnsCarried = isZeroTurnPassthrough
+      ? (ancestor?.turnsCarried ?? 0)
+      : Math.min(compiled.turns.length, settings.recentTurnsVerbatim);
     const baseBannerData: SwitchBannerData = {
       switchId,
       fromProvider: sourceProvider,
@@ -585,7 +591,7 @@ export async function handleSwitchModel(
       toProvider: input.targetProvider,
       toModel: resolvedTargetModel,
       turnsCarried,
-      totalTurns: compiled.turns.length,
+      totalTurns: effectiveTotalTurns,
       hopCount,
       filesTouched: compiled.filesTouched.slice(0, 12),
       gitBranch: compiled.git.branch,
