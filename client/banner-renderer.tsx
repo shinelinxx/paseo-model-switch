@@ -462,7 +462,7 @@ const SwitchBannerExpandedBody = memo(function SwitchBannerExpandedBody({
 export function createBannerRenderer(
   getComposers: (selector: PluginComposerSelector) => readonly PluginComposer[],
 ) {
-  return memo(function SwitchBannerRenderer({
+  const SwitchBannerInner = memo(function SwitchBannerInner({
     theme,
     layout,
     agentId,
@@ -569,4 +569,8 @@ export function createBannerRenderer(
       </View>
     );
   });
+
+  return function SwitchBannerRenderer(props: PluginTimelineItemProps<SwitchBannerData>) {
+    return <SwitchBannerInner {...props} />;
+  };
 }
